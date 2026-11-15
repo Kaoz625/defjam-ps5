@@ -52,7 +52,7 @@ stage_src() {
     else
         log "src: updating to origin/$BRANCH"
         git -C "$SRC" fetch origin "$BRANCH"
-        git -C "$SRC" checkout -q -B "$BRANCH" "origin/$BRANCH"
+        git -C "$SRC" checkout -q -f -B "$BRANCH" "origin/$BRANCH"   # tracked files only; src/recomp/gen stays
     fi
     log "src: $(git -C "$SRC" log --oneline -1)"
 }
