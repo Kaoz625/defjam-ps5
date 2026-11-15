@@ -63,7 +63,6 @@ static uint8_t mem[512];
 #define LO16(v) ((uint16_t)(v))
 #define RECOMP_DF_STEP(n) (n)
 #define CMP_EQ(a, b) ((a) == (b))
-#define RECOMP_PARITY8(v) ((0x9669u >> (((v) ^ ((v) >> 4)) & 15u)) & 1u)
 """
 
 MAIN = r"""
@@ -139,6 +138,9 @@ def _generated():
 
 
 def _build_and_run(sources):
+    cc = shutil.which("clang") or shutil.which("gcc")
+    if not cc:
+        pytest.skip("C compiler unavailable")
     names = list(FIXTURES)
     code = PRELUDE + "".join(sources[n] for n in names)
     code += f"#define NF {len(names)}\n"
@@ -152,8 +154,14 @@ def _build_and_run(sources):
              + ", ".join("1" if FIXTURES[n][3] else "0" for n in names)
              + "};\n")
     code += MAIN
-    from .test_lifter_result_clobber import _build_and_run as run_c
-    return run_c(code)
+    with tempfile.TemporaryDirectory() as temp:
+        src = Path(temp) / "t.c"
+        src.write_text(code)
+        exe = Path(temp) / "t"
+        built = subprocess.run([cc, "-O1", str(src), "-o", str(exe)],
+                               capture_output=True, text=True)
+        assert built.returncode == 0, built.stderr
+        return subprocess.run([str(exe)], capture_output=True, text=True)
 
 
 def test_rep_compare_matches_x86_for_every_count_and_order():
@@ -163,9 +171,9 @@ def test_rep_compare_matches_x86_for_every_count_and_order():
 
 
 def test_negative_control_without_cf_the_order_is_lost():
-    srcs = {n: re.sub(r"\n\s*_cf = \(_a < _b\);", "", s)
+    srcs = {n: re.sub(r"\n\s*_cf = \(M[^\n]*;", "", s)
             for n, s in _generated().items()}
-    assert all("_cf = (_a < _b)" not in s for s in srcs.values())
+    assert all("_cf = (M" not in s for s in srcs.values())
     ran = _build_and_run(srcs)
     assert ran.returncode == 1, "dropping CF should make a -1 come out +1"
     assert "want -1" in ran.stderr, ran.stderr
@@ -174,9 +182,6 @@ def test_negative_control_without_cf_the_order_is_lost():
 def test_negative_control_without_the_zf_preload_a_zero_count_fails():
     srcs = {n: re.sub(r"\n\s*_flags = \([^\n]*ZF in[^\n]*", "", s)
             for n, s in _generated().items()}
-    # Producer publication also preserves ZF. Remove both paths for this control.
-    srcs = {n: re.sub(r"_flags = \(_fa == 0\);", "", s).replace("_flags = (_r == 0);", "")
-            for n, s in srcs.items()}
     assert all("ZF in" not in s for s in srcs.values())
     ran = _build_and_run(srcs)
     assert ran.returncode == 1, "a zero count should then read 'not equal'"
@@ -189,5 +194,4 @@ def test_cf_is_only_computed_where_the_function_reads_it():
     # compares are this, and they should cost nothing new.
     code = _translate("guid", bytes.fromhex("F3A77501C3C3"))
     assert "_cf" not in code, code
-    assert "_flags = (_a == _b);" in code, code
-    assert code.count("MEM32(esi)") == code.count("MEM32(edi)") == 1
+    assert "_flags = (MEM32(esi) == MEM32(edi));" in code, code

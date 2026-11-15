@@ -11,6 +11,7 @@ add_library(xbox_apu STATIC
     apu_dsp.c
     apu_mmio_hook.c
     apu_xaudio2.c
+    apu_wav.c
 )
 
 target_include_directories(xbox_apu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -41,13 +42,18 @@ if(WIN32)
     # XAudio2Create rather than at build time here.
     target_link_libraries(xbox_apu PRIVATE platform kernel32 winmm xaudio2_8 ole32)
 else()
-    # Linux: platform layer (Win32 primitives on POSIX) + SDL2 audio + libm
+    # POSIX (macOS, Linux): platform layer (Win32 primitives on POSIX), the
+    # audio device and libm. SDL2 (apu_sdl2.c) by default; with
+    # XBOXRECOMP_SDL3 the same contract on SDL3 (apu_sdl3.c), for a port
+    # whose window and input are SDL3 -- one process cannot hold both.
     if(XBOXRECOMP_SDL3)
         find_package(SDL3 REQUIRED CONFIG)
+        target_sources(xbox_apu PRIVATE apu_sdl3.c)
         target_link_libraries(xbox_apu PRIVATE platform SDL3::SDL3 m)
         target_compile_definitions(xbox_apu PRIVATE XBOXRECOMP_HAVE_SDL3=1)
     else()
         find_package(SDL2 REQUIRED)
+        target_sources(xbox_apu PRIVATE apu_sdl2.c)
         target_link_libraries(xbox_apu PRIVATE platform SDL2::SDL2 m)
     endif()
 endif()

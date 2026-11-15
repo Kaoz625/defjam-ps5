@@ -40,6 +40,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "recomp/gen/recomp_types.h"
+#include "cheats.h"
 
 extern void sub_000158F0(void);
 
@@ -99,10 +100,16 @@ void defjam_unlock_all_on_funccall(const char *text)
     if (!unlock && !debug)
         return;
     if (!s_started) {
-        /* The managers sub_000158F0 reads exist once the front end is up. */
-        if (strstr(text, "Game.StartMainMenu"))
+        /* The managers sub_000158F0 reads exist once the front end is up.
+         * skip_intro bypasses bootLoad's Game.StartMainMenu(0); the actual
+         * main-menu screen is also a safe activation boundary. */
+        if (strstr(text, "Game.StartMainMenu")) {
             s_started = 1;
-        return;
+            return;
+        }
+        if (!strstr(text, "Control.GetScreenInfo(intMain/mainMenu."))
+            return;
+        s_started = 1;  /* Apply at the first menu too, before it can use the profile. */
     }
     if (debug)
         MEM8(DEBUG_FLAG) = 1;
@@ -115,7 +122,8 @@ void defjam_unlock_all_on_funccall(const char *text)
  *
  * Game.StartGame is the script method at guest 0x00046E40. It is registered by name and reached
  * through a function pointer, so recomp_lookup_manual() can hand back a wrapper. The wrapper
- * logs, and optionally overrides, what the match is about to be made from.
+ * logs, and optionally overrides, what the match is about to be made from; Story fights start
+ * here too, with the created hero as fighter id 99.
  */
 extern recomp_func_t recomp_lookup(uint32_t xbox_va);
 
@@ -146,15 +154,21 @@ static void start_game_wrapper(void)
         MEM8(gd + 0x1AAAu + i * 5) = (uint8_t)id;
         f = (*end == ',') ? end + 1 : end;
     }
-    fprintf(stderr, "[START] venue(script)=%d fighters(gd+1aaa step 5):", (int)MEM32(game + 0xCA4));
-    for (i = 0; i < 4; i++)
-        fprintf(stderr, " %d", (int)(int8_t)MEM8(gd + 0x1AAAu + i * 5));
-    fprintf(stderr, "\n");
-    fflush(stderr);
+    cheats_start_game(gd);     /* [cheats] story_hero (src/patches/cheats.c) */
+    if (s_start_log) {
+        fprintf(stderr, "[START] venue(script)=%d fighters(gd+1aaa step 5):", (int)MEM32(game + 0xCA4));
+        for (i = 0; i < 4; i++)
+            fprintf(stderr, " %d", (int)(int8_t)MEM8(gd + 0x1AAAu + i * 5));
+        fprintf(stderr, "\n");
+        fflush(stderr);
+    }
     if (real)
         real();
+    cheats_start_game_done(gd);
 }
 
+/* Always wrapped: the Story hero cheat can be turned on in the overlay at any time. Without a
+ * cheat or one of the variables above the wrapper only calls the game's own method. */
 recomp_func_t defjam_start_game_hook(void)
 {
     if (s_start_log < 0) {
@@ -162,5 +176,5 @@ recomp_func_t defjam_start_game_hook(void)
                    *c = getenv("RECOMP_START_FIGHTERS");
         s_start_log = (a && *a && strcmp(a, "0")) || (b && *b) || (c && *c);
     }
-    return s_start_log ? start_game_wrapper : (recomp_func_t)0;
+    return start_game_wrapper;
 }

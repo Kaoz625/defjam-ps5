@@ -21,6 +21,10 @@
  *   4. A notification event stays set across two waits; KeResetEvent clears it.
  */
 #include "kernel.h"
+#if !defined(_WIN32)
+#include <stdlib.h>
+#define _putenv_s(k, v) setenv((k), (v), 1)
+#endif
 #include "xbox_memory_layout.h"
 
 #include <stdio.h>

@@ -73,7 +73,7 @@ size_t pc_input_settings(RecompSetting *out, size_t max)
     size_t n = 0;
     int i;
 
-    input_padmap_defaults(&def);
+    xbox_InputMap_PadMapDefaults(&def);
     if (max < 64) return 0;
     memset(out, 0, sizeof(*out) * 64);
 
@@ -114,11 +114,11 @@ size_t pc_input_settings(RecompSetting *out, size_t max)
     ADD("gamepad", "right_stick", RECOMP_SETTING_ENUM, def.right_stick, 0, 0, k_stick, NULL, 0,
         "Which physical stick is the Xbox right stick (the title uses it for Blazin' moves).");
     for (i = 0; i < INPUT_PAD_CONTROL_COUNT; i++)
-        ADD("gamepad", input_control_name(i), RECOMP_SETTING_STRING, 0, 0, 0, NULL, NULL, 0,
-            i == 0 ? k_source_help : NULL, input_source_name(def.source[i]));
+        ADD("gamepad", xbox_InputMap_ControlName(i), RECOMP_SETTING_STRING, 0, 0, 0, NULL, NULL, 0,
+            i == 0 ? k_source_help : NULL, xbox_InputMap_SourceName(def.source[i]));
 
     for (i = 0; i < INPUT_CONTROL_COUNT; i++)
-        ADD("keyboard", input_control_name(i), RECOMP_SETTING_STRING, 0, 0, 0, NULL, NULL, 0,
+        ADD("keyboard", xbox_InputMap_ControlName(i), RECOMP_SETTING_STRING, 0, 0, 0, NULL, NULL, 0,
             k_control_help[i], k_default_keys[i]);
 #undef ADD
     if (n > 64) { fprintf(stderr, "[INPUT] settings table overflow (%u)\n", (unsigned)n); abort(); }
@@ -174,22 +174,22 @@ static void build_config(InputHostConfig *cfg)
     cfg->padmap.right_stick = (uint8_t)geti("gamepad", "right_stick", INPUT_STICK_RIGHT);
     for (i = 0; i < INPUT_PAD_CONTROL_COUNT; i++) {
         int source;
-        recomp_settings_get_text("gamepad", input_control_name(i), text, sizeof(text), "");
-        source = input_source_from_name(text);
+        recomp_settings_get_text("gamepad", xbox_InputMap_ControlName(i), text, sizeof(text), "");
+        source = xbox_InputMap_SourceFromName(text);
         if (source < 0)
             fprintf(stderr, "[INPUT] [gamepad] %s = %s is not a pad control; the default stays\n",
-                    input_control_name(i), text);
+                    xbox_InputMap_ControlName(i), text);
         else
             cfg->padmap.source[i] = (uint8_t)source;
     }
 
     for (i = 0; i < INPUT_CONTROL_COUNT; i++) {
         int rejected;
-        recomp_settings_get_text("keyboard", input_control_name(i), text, sizeof(text), "");
-        rejected = input_bindings_parse(&cfg->keys, i, text);
+        recomp_settings_get_text("keyboard", xbox_InputMap_ControlName(i), text, sizeof(text), "");
+        rejected = xbox_InputMap_BindingsParse(&cfg->keys, i, text);
         if (rejected)
             fprintf(stderr, "[INPUT] [keyboard] %s: %d name(s) are not keys and were ignored\n",
-                    input_control_name(i), rejected);
+                    xbox_InputMap_ControlName(i), rejected);
     }
 }
 
@@ -398,7 +398,9 @@ void pc_input_window_message(HWND window, UINT msg, WPARAM wp, LPARAM lp)
     }
 }
 
-#else /* !_WIN32 */
+#endif /* _WIN32 */
+
+#if !defined(_WIN32) || defined(DEFJAM_APP)
 
 void pc_input_host_key(int vk, int down)
 {
@@ -412,4 +414,4 @@ void pc_input_host_wheel(int notches)
         xbox_HostInputWheel(notches);
 }
 
-#endif /* _WIN32 */
+#endif /* !_WIN32 || DEFJAM_APP */

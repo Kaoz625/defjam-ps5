@@ -8,11 +8,12 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "apu_xaudio2.h"
 
-/* The XAudio2 backend is Windows-only. On Linux all xa2_* functions are
- * stubbed to report inactive; real audio output via SDL2 comes later. */
+/* The XAudio2 backend is Windows-only. On POSIX hosts apu_sdl2.c provides
+ * the same xa2_* functions over SDL2. */
 #if defined(_WIN32)
 
 #define COBJMACROS
@@ -24,19 +25,48 @@
 
 #define XA2_SAMPLE_RATE   48000
 #define XA2_CHANNELS      2
-#define XA2_BUF_SAMPLES   1024   /* ~21ms per submission */
-#define XA2_NUM_BUFS      3
+/* Device buffer size and count. Defaults 512 x 4 (10.7 ms each, 43 ms
+ * worst case queued); RECOMP_AUDIO_BUF_SAMPLES and RECOMP_AUDIO_BUF_COUNT
+ * override them at xa2_init, clamped to the static storage below. */
+#define XA2_BUF_SAMPLES_DEFAULT 512
+#define XA2_NUM_BUFS_DEFAULT    4
+#define XA2_BUF_SAMPLES_MIN     128
+#define XA2_BUF_SAMPLES_MAX     4096
+#define XA2_NUM_BUFS_MIN        2
+#define XA2_NUM_BUFS_MAX        8
+
+static int g_xa2_buf_samples = XA2_BUF_SAMPLES_DEFAULT;
+static int g_xa2_num_bufs    = XA2_NUM_BUFS_DEFAULT;
+#define XA2_BUF_SAMPLES g_xa2_buf_samples
+#define XA2_NUM_BUFS    g_xa2_num_bufs
+
+static int xa2_env_int(const char *name, int def, int lo, int hi)
+{
+    const char *e = getenv(name);
+    int v;
+    if (!e || !*e) return def;
+    v = atoi(e);
+    if (v < lo) v = lo;
+    if (v > hi) v = hi;
+    return v;
+}
 
 static IXAudio2               *g_xa2 = NULL;
 static IXAudio2MasteringVoice *g_xa2_master = NULL;
 static IXAudio2SourceVoice    *g_xa2_source = NULL;
-static int16_t                 g_xa2_bufs[XA2_NUM_BUFS][XA2_BUF_SAMPLES][2];
+/* One slot more than can be queued: with every buffer on the voice, the
+ * next one is staged in a slot the voice does not hold. With only
+ * XA2_NUM_BUFS slots the staging buffer was the oldest queued one, and
+ * filling it overwrote audio the device had not played yet. */
+#define XA2_RING (XA2_NUM_BUFS + 1)
+static int16_t                 g_xa2_bufs[XA2_NUM_BUFS_MAX + 1][XA2_BUF_SAMPLES_MAX][2];
 static int                     g_xa2_next_buf = 0;
+static int                     g_xa2_fill = 0;  /* samples staged in bufs[next_buf] */
+static unsigned  g_xa2_underruns;
+static int       g_xa2_dry;
+static ULONGLONG g_xa2_underrun_logged;
 static int                     g_xa2_initialized = 0;
 static int                     g_xa2_frames_written = 0;
-/* Submissions refused because the queue was full, and submissions that
- * found it empty (the device had run dry: a gap in what is heard). */
-int                            g_xa2_dropped, g_xa2_starved;
 
 int xa2_init(void)
 {
@@ -45,6 +75,12 @@ int xa2_init(void)
     WAVEFORMATEX wfx = { 0 };
 
     if (g_xa2_initialized) return 1;
+
+    g_xa2_buf_samples = xa2_env_int("RECOMP_AUDIO_BUF_SAMPLES",
+                                    XA2_BUF_SAMPLES_DEFAULT,
+                                    XA2_BUF_SAMPLES_MIN, XA2_BUF_SAMPLES_MAX);
+    g_xa2_num_bufs = xa2_env_int("RECOMP_AUDIO_BUF_COUNT", XA2_NUM_BUFS_DEFAULT,
+                                 XA2_NUM_BUFS_MIN, XA2_NUM_BUFS_MAX);
 
     hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
     if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
@@ -87,11 +123,14 @@ int xa2_init(void)
     }
 
     g_xa2_next_buf = 0;
+    g_xa2_fill = 0;
+    g_xa2_dry = 0;
     g_xa2_initialized = 1;
     g_xa2_frames_written = 0;
 
-    fprintf(stderr, "[XA2] XAudio2 initialized (%d Hz stereo 16-bit, %d x %d-sample buffers)\n",
-            XA2_SAMPLE_RATE, XA2_NUM_BUFS, XA2_BUF_SAMPLES);
+    fprintf(stderr, "[XA2] XAudio2 initialized (%d Hz stereo 16-bit, %d x %d-sample buffers, %.1f ms queued max)\n",
+            XA2_SAMPLE_RATE, XA2_NUM_BUFS, XA2_BUF_SAMPLES,
+            1000.0 * XA2_NUM_BUFS * XA2_BUF_SAMPLES / XA2_SAMPLE_RATE);
     return 1;
 
 fail:
@@ -128,40 +167,48 @@ int xa2_is_active(void)
     return g_xa2_initialized;
 }
 
-/* Submit a buffer of mixed samples to XAudio2.
- * Called from APU frame thread. Returns 1 if buffer was submitted. */
+/* Hand mixed samples to XAudio2. Called from the APU frame thread with one
+ * EP period (256 samples) at a time. Samples accumulate in the current device
+ * buffer, which is submitted when full, so a call shorter than a buffer is
+ * kept, not padded or dropped. Returns 1 if every sample was accepted; 0 if
+ * the voice already had every buffer queued when one filled, in which case
+ * that buffer is discarded (pacing by queue depth is what prevents it). */
 int xa2_submit_samples(const int16_t *samples, int num_samples)
 {
     XAUDIO2_VOICE_STATE state;
     XAUDIO2_BUFFER xbuf;
-    int idx;
-    int copy_samples;
+    int idx, n, ok = 1;
     HRESULT hr;
 
     if (!g_xa2_initialized || !g_xa2_source) return 0;
 
-    IXAudio2SourceVoice_GetState(g_xa2_source, &state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
-    if (state.BuffersQueued == 0 && g_xa2_frames_written > 0)
-        g_xa2_starved++;
-    if ((int)state.BuffersQueued >= XA2_NUM_BUFS) {
-        g_xa2_dropped++;
-        return 0;
+    while (num_samples > 0) {
+        idx = g_xa2_next_buf;
+        n = XA2_BUF_SAMPLES - g_xa2_fill;
+        if (n > num_samples) n = num_samples;
+        memcpy(g_xa2_bufs[idx][g_xa2_fill], samples,
+               n * XA2_CHANNELS * sizeof(int16_t));
+        g_xa2_fill += n;
+        samples += n * XA2_CHANNELS;
+        num_samples -= n;
+        if (g_xa2_fill < XA2_BUF_SAMPLES)
+            break;
+
+        g_xa2_fill = 0;
+        IXAudio2SourceVoice_GetState(g_xa2_source, &state,
+                                     XAUDIO2_VOICE_NOSAMPLESPLAYED);
+        if ((int)state.BuffersQueued >= XA2_NUM_BUFS) { ok = 0; continue; }
+
+        memset(&xbuf, 0, sizeof(xbuf));
+        xbuf.AudioBytes = XA2_BUF_SAMPLES * XA2_CHANNELS * sizeof(int16_t);
+        xbuf.pAudioData = (const BYTE *)g_xa2_bufs[idx];
+        hr = IXAudio2SourceVoice_SubmitSourceBuffer(g_xa2_source, &xbuf, NULL);
+        if (FAILED(hr)) { ok = 0; continue; }
+
+        g_xa2_next_buf = (idx + 1) % XA2_RING;
+        g_xa2_frames_written++;
     }
-
-    idx = g_xa2_next_buf;
-    copy_samples = (num_samples > XA2_BUF_SAMPLES) ? XA2_BUF_SAMPLES : num_samples;
-    memcpy(g_xa2_bufs[idx], samples, copy_samples * XA2_CHANNELS * sizeof(int16_t));
-
-    memset(&xbuf, 0, sizeof(xbuf));
-    xbuf.AudioBytes = copy_samples * XA2_CHANNELS * sizeof(int16_t);
-    xbuf.pAudioData = (const BYTE *)g_xa2_bufs[idx];
-
-    hr = IXAudio2SourceVoice_SubmitSourceBuffer(g_xa2_source, &xbuf, NULL);
-    if (FAILED(hr)) return 0;
-
-    g_xa2_next_buf = (idx + 1) % XA2_NUM_BUFS;
-    g_xa2_frames_written++;
-    return 1;
+    return ok;
 }
 
 int xa2_get_buffer_size(void)
@@ -169,223 +216,63 @@ int xa2_get_buffer_size(void)
     return XA2_BUF_SAMPLES;
 }
 
-#else /* !_WIN32 -- the same interface on an SDL audio device */
-
-#ifdef XBOXRECOMP_HAVE_SDL3
-#include <SDL3/SDL.h>
-#else
-#include <SDL.h>
-#endif
-#include <stdlib.h>
-#include <string.h>
-
-#define XA2_SAMPLE_RATE   48000
-#define XA2_CHANNELS      2
-#define XA2_BUF_SAMPLES   1024   /* ~21ms per submission */
-#define XA2_NUM_BUFS      3
-#define RING_FRAMES       8192   /* power of two, well over what is ever queued */
-/* The device starts, and starts again after running out, once this much is
- * waiting: two submissions, 43 ms. Without it the ring sits near empty and
- * any lateness in the mixer is a gap. Above XA2_RING_MAX a submission is
- * refused, which bounds the delay when the mixer's clock runs fast. */
-#define XA2_PREROLL       (2 * XA2_BUF_SAMPLES)
-#define XA2_RING_MAX      (4 * XA2_BUF_SAMPLES)
-
-/* A ring the device's callback drains. SDL's own queue cannot tell "empty
- * because the device took it all into its buffer" from "empty because nothing
- * was sent", and the second is the one that is heard. */
-static SDL_AudioDeviceID g_sdl_dev;
-static int16_t  g_ring[RING_FRAMES][XA2_CHANNELS];
-static unsigned g_ring_r, g_ring_w;         /* frame counters, free-running */
-static int g_xa2_initialized;
-static int g_xa2_frames_written;
-static int g_dry;                           /* the callback is in a gap */
-static int g_primed;                        /* enough is queued to play from */
-/* As on Windows: submissions refused because three buffers were waiting, and
- * times the device ran out (a gap in what is heard). */
-int  g_xa2_dropped, g_xa2_starved;
-
-static void sdl_callback(void *user, Uint8 *stream, int len)
+int xa2_get_buffer_count(void)
 {
-    int16_t (*out)[XA2_CHANNELS] = (void *)stream;
-    unsigned want = (unsigned)len / (XA2_CHANNELS * sizeof(int16_t)), i;
-    unsigned have = g_ring_w - g_ring_r;
+    return XA2_NUM_BUFS;
+}
 
-    (void)user;
-    if (!g_primed) {
-        if (have < XA2_PREROLL) {
-            memset(stream, 0, (size_t)len);
-            return;
+/* Samples handed over and not yet played: the buffers the voice still
+ * holds plus what is staged in the next one. Also the underrun detector:
+ * the voice running dry after audio has started is one underrun, counted
+ * once per dry spell and reported at most once a second. A drain announced
+ * by xa2_expect_drain (the frame thread pausing) is not one. */
+int xa2_queued_samples(void)
+{
+    XAUDIO2_VOICE_STATE state;
+
+    if (!g_xa2_initialized || !g_xa2_source) return 0;
+    IXAudio2SourceVoice_GetState(g_xa2_source, &state,
+                                 XAUDIO2_VOICE_NOSAMPLESPLAYED);
+    if (state.BuffersQueued == 0 && g_xa2_frames_written > 0) {
+        if (!g_xa2_dry) {
+            ULONGLONG now = GetTickCount64();
+            g_xa2_dry = 1;
+            g_xa2_underruns++;
+            if (now - g_xa2_underrun_logged >= 1000) {
+                g_xa2_underrun_logged = now;
+                fprintf(stderr, "[XA2] underrun x%u\n", g_xa2_underruns);
+            }
         }
-        g_primed = 1;
-    }
-    if (have > want)
-        have = want;
-    for (i = 0; i < have; i++)
-        memcpy(out[i], g_ring[(g_ring_r + i) % RING_FRAMES], sizeof out[i]);
-    g_ring_r += have;
-    if (have < want) {
-        memset(out[have], 0, (size_t)(want - have) * sizeof out[0]);
-        /* One gap however many callbacks it lasts, and none before the title
-         * has sent anything. */
-        if (!g_dry && g_xa2_frames_written > 0) {
-            g_dry = 1;
-            g_xa2_starved++;
-        }
-        g_primed = 0;
     } else {
-        g_dry = 0;
+        g_xa2_dry = 0;
     }
+    return (int)state.BuffersQueued * XA2_BUF_SAMPLES + g_xa2_fill;
 }
 
-#ifdef XBOXRECOMP_HAVE_SDL3
-/* SDL3 asks a stream for more instead of handing over a buffer. */
-static void SDLCALL sdl3_feed(void *user, SDL_AudioStream *stream, int additional, int total)
+/* Mark the coming dry spell as already seen; the first call that finds
+ * buffers queued again clears it, so later dry spells count as before. */
+void xa2_expect_drain(void)
 {
-    static Uint8 chunk[4096];
-    (void)total;
-    while (additional > 0) {
-        int n = additional < (int)sizeof chunk ? additional : (int)sizeof chunk;
-        n -= n % (XA2_CHANNELS * (int)sizeof(int16_t));
-        if (n <= 0)
-            break;
-        sdl_callback(user, chunk, n);
-        SDL_PutAudioStreamData(stream, chunk, n);
-        additional -= n;
-    }
+    g_xa2_dry = 1;
 }
-static SDL_AudioStream *g_sdl_stream;
-#endif
 
-int xa2_init(void)
+unsigned xa2_underruns(void)
 {
-#ifdef XBOXRECOMP_HAVE_SDL3
-    SDL_AudioSpec have;
-#else
-    SDL_AudioSpec want, have;
-#endif
-
-    if (g_xa2_initialized)
-        return 1;
-    /* A run without a display is an unattended one: keep its timing (the
-     * dummy driver consumes at the real rate) and keep it quiet. */
-    if (getenv("RECOMP_HEADLESS") && !getenv("SDL_AUDIODRIVER") && !getenv("SDL_AUDIO_DRIVER")) {
-#ifdef XBOXRECOMP_HAVE_SDL3
-        /* SDL3 reads its own copy of the environment, taken before this. */
-        SDL_SetHint(SDL_HINT_AUDIO_DRIVER, "dummy");
-#else
-        setenv("SDL_AUDIODRIVER", "dummy", 1);
-#endif
-    }
-#ifdef XBOXRECOMP_HAVE_SDL3
-    {
-        SDL_AudioSpec spec;
-        if (!SDL_WasInit(SDL_INIT_AUDIO) && !SDL_InitSubSystem(SDL_INIT_AUDIO)) {
-            fprintf(stderr, "[XA2] SDL audio unavailable: %s\n", SDL_GetError());
-            return 0;
-        }
-        spec.freq = XA2_SAMPLE_RATE;
-        spec.format = SDL_AUDIO_S16;
-        spec.channels = XA2_CHANNELS;
-        g_sdl_stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec,
-                                                 sdl3_feed, NULL);
-        if (!g_sdl_stream) {
-            fprintf(stderr, "[XA2] no audio device: %s\n", SDL_GetError());
-            return 0;
-        }
-        g_sdl_dev = SDL_GetAudioStreamDevice(g_sdl_stream);
-        SDL_ResumeAudioStreamDevice(g_sdl_stream);
-        have.freq = spec.freq;
-        have.channels = spec.channels;
-    }
-#else
-    if (!SDL_WasInit(SDL_INIT_AUDIO) && SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) {
-        fprintf(stderr, "[XA2] SDL audio unavailable: %s\n", SDL_GetError());
-        return 0;
-    }
-    SDL_zero(want);
-    want.freq = XA2_SAMPLE_RATE;
-    want.format = AUDIO_S16SYS;
-    want.channels = XA2_CHANNELS;
-    want.samples = 512;
-    want.callback = sdl_callback;
-    g_sdl_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
-    if (!g_sdl_dev) {
-        fprintf(stderr, "[XA2] no audio device: %s\n", SDL_GetError());
-        return 0;
-    }
-    SDL_PauseAudioDevice(g_sdl_dev, 0);
-#endif
-    g_xa2_initialized = 1;
-    g_xa2_frames_written = 0;
-    fprintf(stderr, "[XA2] SDL audio output initialized (%d Hz, %d channels, driver %s)\n",
-            have.freq, have.channels, SDL_GetCurrentAudioDriver());
-    return 1;
+    return g_xa2_underruns;
 }
 
-void xa2_shutdown(void)
+uint64_t xa2_samples_played(void)
 {
-#ifdef XBOXRECOMP_HAVE_SDL3
-    if (g_sdl_stream) {
-        SDL_DestroyAudioStream(g_sdl_stream);
-        g_sdl_stream = NULL;
-    }
-    g_sdl_dev = 0;
-#else
-    if (g_sdl_dev) {
-        SDL_CloseAudioDevice(g_sdl_dev);
-        g_sdl_dev = 0;
-    }
-#endif
-    if (g_xa2_initialized)
-        fprintf(stderr, "[XA2] Shut down (%d frames written)\n", g_xa2_frames_written);
-    g_xa2_initialized = 0;
+    XAUDIO2_VOICE_STATE state;
+
+    if (!g_xa2_initialized || !g_xa2_source) return 0;
+    IXAudio2SourceVoice_GetState(g_xa2_source, &state, 0);
+    return state.SamplesPlayed;
 }
 
-int xa2_is_active(void) { return g_xa2_initialized; }
+#else /* !_WIN32: apu_sdl2.c implements the same contract over SDL2 */
 
-int xa2_submit_samples(const int16_t *samples, int num_samples)
-{
-    unsigned n = (unsigned)(num_samples > XA2_BUF_SAMPLES ? XA2_BUF_SAMPLES : num_samples), i;
-    int ok = 1;
-
-    if (!g_xa2_initialized || !g_sdl_dev)
-        return 0;
-    /* A gap in the sound goes in the log, from here rather than from the device's own
-     * thread: when it happened and how many so far, so a stutter can be lined up with
-     * what the game was doing. */
-    {
-        static int told, seen;
-        if (g_xa2_starved != seen && told < 60) {
-            fprintf(stderr, "[XA2] the device ran dry (gap %d, %d frames written, %d submissions refused)\n",
-                    g_xa2_starved, g_xa2_frames_written, g_xa2_dropped);
-            told++;
-        }
-        seen = g_xa2_starved;
-    }
-#ifdef XBOXRECOMP_HAVE_SDL3
-    SDL_LockAudioStream(g_sdl_stream);
-#else
-    SDL_LockAudioDevice(g_sdl_dev);
-#endif
-    if (g_ring_w - g_ring_r + n > XA2_RING_MAX) {
-        g_xa2_dropped++;
-        ok = 0;
-    } else {
-        for (i = 0; i < n; i++)
-            memcpy(g_ring[(g_ring_w + i) % RING_FRAMES], samples + i * XA2_CHANNELS,
-                   sizeof g_ring[0]);
-        g_ring_w += n;
-        g_xa2_frames_written++;
-    }
-#ifdef XBOXRECOMP_HAVE_SDL3
-    SDL_UnlockAudioStream(g_sdl_stream);
-#else
-    SDL_UnlockAudioDevice(g_sdl_dev);
-#endif
-    return ok;
-}
-
-int xa2_get_buffer_size(void) { return XA2_BUF_SAMPLES; }
+/* ISO C wants at least one declaration in a translation unit. */
+typedef int apu_xaudio2_posix_unused;
 
 #endif /* _WIN32 */

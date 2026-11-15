@@ -24,6 +24,23 @@ fail() {
     exit 1
 }
 
+# The app (src/app, the AppImage) writes where it is to app-location.txt whenever it opens this
+# install. Shortcuts that still point here then open the app, which holds the lock and plays the
+# game itself: --no-launcher becomes the app's --play, --launcher stays, other options are dropped.
+# Without that file, or with the app gone, this plays the game as before.
+APP=$(head -n 1 "$ROOT/app-location.txt" 2> /dev/null || true)
+if [ -n "$APP" ] && [ -f "$APP" ] && [ -x "$APP" ]; then
+    FORWARD=""
+    for arg in "$@"; do
+        case "$arg" in
+            --no-launcher) FORWARD="--play" ;;
+            --launcher) FORWARD="--launcher" ;;
+        esac
+    done
+    # shellcheck disable=SC2086
+    exec "$APP" --install "$ROOT" $FORWARD
+fi
+
 [ -x "$EXECUTABLE" ] || fail "No completed installation was found. Run Def Jam Setup to install or repair it."
 
 # Held for the life of the game: an update or repair cannot replace a running game.
@@ -34,9 +51,11 @@ flock -n 9 || fail "The game or an update is already running."
 
 cd "$SOURCE" || fail "The installed game folder is missing. Run Def Jam Setup to repair it."
 export DEFJAM_DATA="$DATA"
+export DEFJAM_INSTALL_DIR="$ROOT"
 
 # Keep the ten newest session logs so a problem report always has the last run.
 LOGS="${XDG_STATE_HOME:-$HOME/.local/state}/DefJamRecompiled/logs"
+export DEFJAM_LOG_DIR="$LOGS"
 if mkdir -p "$LOGS" 2> /dev/null; then
     ls -1 "$LOGS" 2> /dev/null | grep '^play-.*\.log$' | sort | head -n -9 | while read -r old; do
         rm -f "$LOGS/$old" "$LOGS/$old.err"

@@ -1,11 +1,10 @@
 # Gameplay test harness
 
-How to run the scripted gameplay checks and read what they prove. The roadmap
-behind this is [08-testing-roadmap.md](08-testing-roadmap.md); what is still
-missing is listed at the end.
+How to run scripted gameplay checks and read what they prove. Current policy is
+in [the test plan](02-test-plan.md); future coverage belongs in GitHub Issues.
 
 Everything here needs a local build made from your own dump. Hosted CI has no
-game data and runs only the unit tests. Captures, audio and reports are the
+game data; it runs unit/native fixtures, source compilation and game-free Setup checks. Captures, audio and reports are the
 game's artwork and stay under `logs/`, which git ignores.
 
 ## Three levels
@@ -13,17 +12,50 @@ game's artwork and stay under `logs/`, which git ignores.
 | Command | Time | What it is for |
 |---|---|---|
 | `python scripts/regress.py --quick` | about 10 min | after every change: unit tests, three golden frames, one fight |
-| `python scripts/regress.py` | about an hour | before a commit that touches the runtime, renderer or generated code |
+| `python scripts/regress.py` | about an hour | once per platform on each release candidate ([releasing](releasing.md)); a pull request runs `--only` checks for its area |
 | `python scripts/scenario_suite.py run <route> ...` | one launch | one scenario with all its evidence and a browsable report |
 
 Never run two of these at once: they share the save area, the window and the
 frame-rate measurements.
 
+Leave `RECOMP_HEADLESS` unset for the full suite: its presence suppresses the
+launcher, so the launcher/checkbox checks cannot run in that mode.
+
+Harness and scenario runs skip the startup legal screen and EA/THX/intro movies
+by default. Both quick and full regression keep one complete normal startup in
+`m3`: it requires legal, all three movies and Press Start in order, then compares
+the title image. Other checks use the shorter boot. Story scenes and move previews
+remain enabled. Input and timed captures start at the actual Press Start screen
+request, so either boot path works without changing route timings.
+
+For an individual normal boot, pass `--env RECOMP_SKIP_INTRO=0` to the harness.
+An empty override (`--env RECOMP_SKIP_INTRO=`) removes the test default and uses
+the specified INI or the game's default-off setting. This test default does not
+change a player's settings file or normal game launches.
+
+The named Terrordome stress routes and generated Terrordome scenarios also select retail venue FE ID6 through
+ChooseVenue before loading; the stress checks require its final StartGame observation. Unlocking every venue changes map traversal;
+the old one-step-right recipe selected Hunt's Point (FE ID14) with the test defaults.
+The positional recipe in the scenario catalog remains dependent on the exact save
+and unlock state; the early command makes Terrordome selection independent of that map order.
+
 The full regression is the quick one plus a four-fighter Free For All, the same
 at the Terrordome for four minutes, the **combat check**, a **two-pad match**, the
 **replay check**, the Story intro, crib, gym and a boot soak. `--only a,b` picks
-checks; `fight-terrordome`, `ffa-result`, `two-matches`, `repeat` and `visual` are
-selectable that way only.
+checks; `fight-terrordome`, `ffa-result`, `two-matches`, `fight-cycles`, `repeat` and `visual`
+are selectable that way only.
+
+The harness explicitly sets `RECOMP_ASPECT=4:3` for the reviewed goldens and replays; new player
+defaults can use Widescreen (Auto) without changing those baselines. An explicit per-run
+`RECOMP_ASPECT` overrides this test choice; an empty value lets the settings file/default apply.
+
+For native launcher help checks, `RECOMP_LAUNCHER_SCRIPT` accepts `<ms>:ui:<id>` to click a named
+control and `<ms>:hover:<id>` to reveal/hover it without editing its value (for example,
+`600:ui:Advanced;1200:hover:display.render_scale`). `<ms>:uiopt:<id>` clicks it if it is there and says
+nothing if not, for a control that exists in one layout only: a narrow or large-text launcher (the Steam Deck's)
+draws an on/off setting as an Off/On list, whose items are `<section>.<key>.on` and `.off`, where a wide one
+draws a checkbox (`2000:ui:display.vignette;2600:uiopt:display.vignette.off`). Captures and quit use the
+existing script actions.
 
 ## The combat check
 
@@ -75,7 +107,8 @@ machine and GPU driver, the fixture's hashes, the settings, the input schedule a
 which gates were selected. A gate that could not be evaluated is an error.
 
 Routes: `fight`, `fight-result`, `ffa`, `ffa-result`, `versus` (two pads),
-`two-matches` (a One on One and a Free For All in one launch), `fight-terrordome`,
+`two-matches` (a One on One and a Free For All in one launch), `fight-cycles` (five One on
+Ones in one launch, then a held menu), `fight-terrordome`,
 `ffa-terrordome`, `story-tour` (crib and gym in one launch), `intro`, `crib`, `gym`,
 `boot`, `unlock`.
 
@@ -90,6 +123,9 @@ Options:
 - `--step-shots N,N` capture the frame at those fight steps.
 - `--settings file.json` render scale, gamma and vsync for the run.
 - `--session-plan file.json` experimental: live input driven by screen events.
+- `--record` turn the [play-test recorder](playtest-recorder.md) on: the run's frame rows, events and
+  pictures are kept, analysed with `scripts/bug-bundle.py` and linked from the report; `--record-hitch-ms N`
+  also saves a bundle for every frame of N ms or more.
 
 ## Repeatable fights
 
@@ -114,6 +150,12 @@ save fixtures, so its hash is kept in `tests/golden/fight-stream.json` as a reco
 of how the fight plays. The full regression's `replay` check plays the pinned fight
 once and compares with that hash: a change to the translator or the runtime that
 alters the simulation fails it even if the picture still looks right.
+
+On a slow host the same pinned fight can part from itself (the Steam Deck, #98): the spectators' positions
+follow the host's timing, two match-logic generators are seeded from the time-stamp counter, and a
+general-purpose generator is drawn once per presented frame. `--isolate-crowd` (on `scenario_suite.py run` and
+on `regress.py`) removes those, changes how the fight plays and so has its own golden,
+`tests/golden/fight-stream-isolated.json`; `docs/research/deck-determinism-98.md` has the evidence.
 
 ```powershell
 python scripts/regress.py --only replay            # one fight against the golden hash
@@ -156,7 +198,7 @@ run it starts; `--env RECOMP_UNLOCK_ALL=0` turns it off for one (the scenario su
 variables, so it takes `--no-unlock`). The `replay` and `repeat` checks use `--no-unlock`: with the unlock
 on, the pinned fight plays differently (95 records against the golden 80; the cause is not known), and
 the golden was recorded without it. For a game you start yourself the
-switch is the `[debug] unlock_all` setting (the General page of the launcher and overlay), or the
+switch is the `[debug] unlock_all` setting (the Diagnostics page of the launcher and overlay), or the
 variable. `RECOMP_UNLOCK_ALL=1` runs the developers' own unlock routine (guest `0x000158F0`, still in the
 retail image) on each screen change once the main menu has started: all 74 fighters and every
 venue are available, whatever the profile holds, a new one included. It is runtime-only and off
@@ -183,7 +225,7 @@ made, so any fighter on any venue can be tested without scripting the menus:
 | Variable | Meaning |
 |---|---|
 | `RECOMP_START_FIGHTERS=a,b[,c,d]` | The fighter in each slot, by `<ID>` in `fighter.xml` (the default One on One is `56,55`, Blaze and Doc). Fewer ids than slots leave the rest as chosen. |
-| `RECOMP_START_VENUE=n` | The venue, as the `<feID>` number in `venue.xml` that `Game.ChooseVenue(n)` carries (1 is The Foundation, the default; 17 is Gun Hill Garage). The game maps it to the venue it stores through a table of 14 ids (0-5, 8, 10-13, 17, 24, 26); an id not in the table gives venue 0, a plain rubble floor, so check the picture for the ones you rely on. |
+| `RECOMP_START_VENUE=n` | The venue, as the `<feID>` number in `venue.xml` that `Game.ChooseVenue(n)` carries (1 is The Foundation, the default; 17 is Gun Hill Garage). StartGame also maps it through a compact 13-entry table (0-5, 8, 10-12, 17, 24, 26), with a zero fallback, while separately loading venue data by the original FE ID. That compact field alone does not identify the rendered arena; verify the loading caption and fight. See `docs/research/startup-skip-venue-audit.md`. |
 | `RECOMP_START_LOG=1` | Print what `Game.StartGame` is about to be given (`[START]` in the log). Setting either variable above prints it too. |
 
 ```bash
@@ -207,9 +249,28 @@ fighter, not the `<ID>`, so check the names on the HUD. The addresses and the ru
 - **Frame pacing.** From the runtime's two-second reports during the fight: the
   median present interval within 1 ms of 16.67, and at most 2 percent of presents
   later than 1.5 times their window's median.
-- **Memory.** The game's private bytes, sampled every five seconds, must not have
-  grown more than 64 MB from the start of play to the end of the run. This catches
-  a fast leak; one fight is too short for a slow one.
+- **Memory.** Samples every 5 seconds. Windows samples private bytes; POSIX samples
+  RSS despite the JSON field name `private_bytes`. These OS metrics are not directly
+  comparable, and a positive delta is not an attributed leak.
+  - **Baseline:** the highest of the first three samples from 20 seconds after
+    `Game.StartGame`.
+  - **`performance.memory_growth`** (limit 64 MiB): compares the baseline with the
+    highest of the last three samples in the last match's settled fight window, which
+    runs from 20 seconds after its `StartGame` to its first `GetMatchSummary`. Its
+    metrics give the same figure for every match (`cycle_growth_mb`).
+  - **`performance.memory_transition`** (limit 256 MiB): reports scene changes
+    separately. It bounds the highest sample of play against the baseline, and also
+    reports where the run ended. A sample taken in a result or menu load holds decode
+    buffers in flight and, on Linux, free memory in the decode workers' glibc arenas
+    (issue #166), so it is not mixed into the growth figure.
+  - **Endpoint fallback:** without a timeline, or when the first or last fight window
+    has fewer than three samples, growth falls back to the old last-sample reading
+    (`method: endpoint`) and no transition row is written.
+  - **Repeated cycles:** `--only fight-cycles` plays five One on Ones in one launch.
+    This is the most the native pad script holds (4095 characters, 32 distinct
+    anchors).
+  - Preserve earlier threshold failures as they were recorded; see the
+    [v0.13 investigation](research/rc-v0.13.0-hd-memory.md) and issue #166.
 
 ## Visual baselines
 
@@ -268,6 +329,30 @@ inherited diagnostics and records the explicit pack inputs in its report.
 Ordinary original-texture scenarios omit both flags. Pack-on captures have
 separate review evidence; they do not replace the original-texture goldens.
 
+## Scenarios on demand
+
+`scripts/scenarios.py` starts a run where a bug is ([details](research/scenario-launching.md)):
+
+```powershell
+python scripts/scenarios.py fixture add crib-day1 --story crib --note "after the first fight"   # the current saves, into a library
+python scripts/scenarios.py list                                                                 # modes, venues, Story points, fixtures
+python scripts/scenarios.py generate --mode free-for-all --venue terrordome --fixture crib-day1 --seed 12345 --record
+python scripts/scenarios.py generate --mode one-on-one --p1 "right@4;right@5;a@7;a@12;a@16;a@20;a@24;a@28" --fixture crib-day1 --expect-character 0:5
+python scripts/scenarios.py cutscene --fixture crib-day1 --from crib --inject "getscreeninfo(story/crib#1=>Some.Command(x))"
+```
+
+The fixture library lives in the data folder (`<data>/fixtures/`, with `library.json`), never in the
+repository. Generated routes come from `config/scenario-catalog.json`; the combinations the harness
+already had generate exactly its routes. `--expect-character SLOT:INDEX` fails a run whose menus picked
+another fighter (from the `match_start` telemetry), which is how a new fighter or venue move list is
+calibrated. `cutscene` uses `RECOMP_FE_INJECT` to send the front end a command once a Story point is
+reached; which command starts a chosen scene is still to be found (`scripts/funccall-catalog.py`).
+
+`scripts/crowd-lab.py run --fixture NAME` plays a pinned fight twice under each crowd control
+(`RECOMP_TEST_CROWD=hold`, `reseed`, both, and inline workers) and tabulates whether the crowds came out
+the same; `crowd-lab.py mask` learns which cells of a fight step's capture move between runs and writes
+them as baseline `masks`, refusing a mask that would hide a fighter.
+
 ## Not done
 
 
@@ -275,10 +360,55 @@ separate review evidence; they do not replace the original-texture goldens.
 - Repeatability is not guaranteed even for thirty seconds: the spectators push
   fighters, the spectators do not repeat, and pinned pairs have parted at step 871.
   The `replay` check has passed every time so far and can fail by chance.
-- Whole-frame fight baselines: the crowds are not repeatable (see above).
+- Whole-frame fight baselines: the crowds are not repeatable (see above). The crowd controls and learned
+  masks (`scripts/crowd-lab.py`) exist but have not been measured on the game.
 - Sounds are not tied to events (hit effects, the announcer).
 - A human win, time-up, grapples and throws as such, save and load, and cutscene
   skipping are not covered.
 - The live-input session recipes in `tests/scenarios/` are uncalibrated examples;
   the `two-matches` route uses the ordinary pad script instead.
 - Long sessions and many repeated matches are not measured.
+
+## Coverage follow-ups
+
+Future coverage is tracked in GitHub, not a parallel roadmap: [Story fixture identity](https://github.com/vyanhursky/DefJamFFNY-recomp/issues/172), [gameplay/lifecycle assertions](https://github.com/vyanhursky/DefJamFFNY-recomp/issues/173), [audiovisual fidelity](https://github.com/vyanhursky/DefJamFFNY-recomp/issues/174), [report provenance](https://github.com/vyanhursky/DefJamFFNY-recomp/issues/175) and [cross-title compatibility adapters](https://github.com/vyanhursky/DefJamFFNY-recomp/issues/176). These describe missing test evidence, not newly established gameplay bugs.
+
+
+## Fast-start precedence and measurement limits
+
+`startup_default()` runs after the caller's environment merge: explicit `0` remains normal, an explicit empty value removes the variable, and only absence receives automation default1. This shared `run_game()` boundary also serves scenario-suite instances that sanitize inherited RECOMP variables; changing only the regression module's environment would miss them. Read the final child environment in run identities before claiming a route used fast startup. Sanitize inherited pad scripts/RECOMP options for the one normal `m3` boot and keep the existing title golden: require ordered actual FUNCCALL/PATH evidence for legal1, bootLoad, Game.StartMainMenu(0), EA/THX/intro opens, then preStart. Movie opens and normal progression are positive sequence evidence, not per-frame decoder telemetry.
+
+The `skipintro` matrix removes the injected default for real default-off and INI-only cases; environment-off overrides INI-on, environment-on overrides INI-off, and the combined unlock case retains its independent unlock setting. Off cases may stop at positive legal1 because m3 supplies the complete presentation once. UI checkbox tests also clear the override so the widget is editable. The startup-fault parser ends at the first main-menu request; a long idle-title run can intentionally open attract `intro.mad` before that, so test attract separately rather than classify its whole log with that parser.
+
+Initial M2/resource-crest and launcher-only captures may end before any front-end selector event; do not require preStart in those deliberately short captures. Skipped soak boots measure accelerated-boot stability; they do not establish repeated full-movie reliability. Preserve original fight durations, replay hashes and strict audio gates. Use disposable INIs: the complete-save-root guard restores saves/caches, not arbitrary settings files beside them. Recorder output is independent of that guard; record-on performance evidence must be labeled separately.
+
+
+## Front-end background route boundaries (inventory, 2026-10-20)
+
+This was a source/flow/fixture inventory, not a native capture pass. A route reaching a parent screen or loading a catalogue entry does not prove a child movie appeared.
+
+| Consumer | Existing route/anchor | Proven boundary and remaining calibration |
+|---|---|---|
+| `story/charDec` | `harness.py run intro --png`; `getscreeninfo(story/chardec)` | Route captures eight seconds after creator entry; fixture/profile identity still matters. |
+| `battle/oldMLoad` | `fight-terrordome` / `ffa-terrordome`; `getscreeninfo(battle/oldmload` | Normal Battle traverses this loading card. Its dynamic wall is `screens/match/0_bg/paper_1v1.big`, with `paper_ffa3`, `paper_ffa4`, `paper_team` variants; it is distinct from `battle/matchLoa.big`. |
+| `battle/matchLoa` | Catalogue lists `Game.StartGame()` | Separate APT from `oldMLoad`; catalogue presence alone does not establish runtime visitation. Observe the loading handoff before adding an anchor. |
+| `battle/tips` | `fight-result` waits for `game.getmatchsummary(` | Flow exits tips to `battle/cmtype`, but this route does not wait for/capture tips. Observe result/rewards/rematch calls before claiming coverage. |
+| `options/cribOptions` | `crib` reaches `story/crib`; flow explicitly links parent/child both ways | Existing route stops at the parent. Calibrate visible Options input from a disposable fixture; transition ordering is not a button map. |
+| `story/choosGF2`, `choosGF4`, `choosPart` | Catalogue associates SWFs with `screens/story/storyChs.big` | Likely parent-managed submovies; no standalone flow transition or calibrated route was established. The inspected fixture library had only `mac-profiles` at Crib, not a `storyChs` checkpoint. |
+
+Use observed `[FUNCCALL]` anchors with `--stage`/`--shots` and the complete-save guard or a disposable scenario fixture. `Control.GetScreenInfo` is a metadata/action channel, not a reliable arbitrary-movie loader. `RECOMP_FE_INJECT` dispatches after an observed call; an APT string catalogue does not prove any listed command loads a target SWF. `scenarios.py scene` / `RECOMP_SCENE` selects developer CINEMA content in `assets/cinema/*.viv`, not front-end APT/SWF screens. Evidence: route definitions, `<data>/fixtures/library.json`, `<data>/extracted/screens/feflow.xml`, and local `logs/menu-ui-v1-rc/funccall-catalog.json` (Markdown despite its suffix). Current missing-fixture/test evidence belongs to [issues172–176](https://github.com/vyanhursky/DefJamFFNY-recomp/issues?q=is%3Aissue+172+OR+173+OR+174+OR+175+OR+176).
+
+## Experimental recipe examples
+
+`tests/scenarios/fight-return.experimental.json` and
+`story-session.experimental.json` illustrate `--session-plan` with host-second
+live input. They explicitly declare `validated_live:false`; calibrate them against
+fresh ordered screen events before using them for acceptance. `session_driver.py`
+is dynamically loaded by the suite and remains required. The visual-manifest
+example shows the local approved-baseline schema; its placeholder hash and
+`approved:false` are not a real baseline. Keep generated reports/media local.
+
+Manual native launcher coverage is available in `scripts/test-mod-launcher.py`;
+its synthetic catalogue/key/data stay disposable. The former hosted RC2 helper
+was retired because it hardcoded version1.0.0-rc2. Its dated acceptance result
+remains in the integration evidence; it is not a current live-catalogue smoke.

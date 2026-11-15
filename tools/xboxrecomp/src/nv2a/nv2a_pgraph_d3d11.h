@@ -34,6 +34,13 @@ void pgraph_d3d11_init(void);
 void pgraph_d3d11_shutdown(void);
 int pgraph_d3d11_try_texture_pack(const RecompTextureSource *source,
                                 RecompTextureSample sample, void *user);
+/* Widescreen side slabs of the stage-0 source (texture_pack_wide_slabs). wide_bind puts slab
+ * `slab` on stage 0, remembering what was bound the first time; wide_end puts that back. */
+int pgraph_d3d11_wide_slabs(int *dt, unsigned max);
+int pgraph_d3d11_wide_bind(unsigned slab);
+void pgraph_d3d11_wide_end(void);
+const char *pgraph_d3d11_stage0_id(void);
+int pgraph_d3d11_stage0_stretch(void);
 
 /* Process an NV2A PGRAPH method call. Called from push buffer parser.
  * Returns 1 if handled, 0 if unhandled (caller should log/ignore). */
@@ -82,6 +89,16 @@ int pgraph_d3d11_set_texture_ready(uint32_t guest_addr, const void *data,
                                    uint32_t width, uint32_t height,
                                    uint32_t nv2a_format);
 
+/* The same for a swizzled or DXT texture that carries `levels` mip levels after
+ * level 0 (SET_TEXTURE_FORMAT's MIPMAP_LEVELS). The chain is uploaded only when
+ * pgraph_d3d11_set_guest_mips is on; otherwise this is set_texture_ready. */
+int pgraph_d3d11_set_texture_ready_mips(uint32_t guest_addr, const void *data,
+                                        uint32_t width, uint32_t height,
+                                        uint32_t nv2a_format, uint32_t levels);
+
+/* Upload and filter the title's own mip levels (off: level 0 only, as before). */
+void pgraph_d3d11_set_guest_mips(int on);
+
 /* The same, for a caller that knows its converted data changed: an entry
  * already cached under the key is refilled now, not at the next periodic
  * re-read. */
@@ -115,6 +132,9 @@ void pgraph_d3d11_set_placement(float kx, float bx);
 void nv2a_ws_configure(float k, float hud_reach);
 void nv2a_ws_hud_heartbeat(int bottom_rows);
 void nv2a_ws_set_side_fill(int on);
+void nv2a_ws_set_left_tag(float y_offset);
+/* Centred 2D whose full-width guest clip may extend to the canvas sides. */
+void nv2a_ws_set_extend_tag(float y_offset);
 
 /* The title's register combiners for the next draws (see the .c). */
 void pgraph_d3d11_set_combiners(const uint32_t *a, const uint32_t *b, const uint32_t *c,
@@ -145,6 +165,14 @@ typedef struct {
     uint32_t methods_handled;
     uint32_t methods_ignored;
     uint32_t clears;
+    /* The texture cache (appended; earlier fields unchanged). Running totals: textures
+     * uploaded, new or changed in place, their bytes, and evictions from a full cache.
+     * Now: the entries the cache holds and their bytes. */
+    uint32_t textures_uploaded;
+    uint32_t texture_evictions;
+    uint64_t texture_upload_bytes;
+    uint32_t textures_cached;
+    uint64_t texture_cache_bytes;
 } PgraphD3D11Stats;
 
 void pgraph_d3d11_get_stats(PgraphD3D11Stats *out);

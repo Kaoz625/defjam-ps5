@@ -11,8 +11,8 @@ pasted into Markdown. Refer to game code by address and describe its behavior.
 
 ## Reporting a problem
 
-Check [known issues](docs/known-issues.md) and the open
-[issues](https://github.com/vyanhursky/DefJamFFNY-recomp/issues) first, then open
+Search [GitHub Issues](https://github.com/vyanhursky/DefJamFFNY-recomp/issues) and read
+[troubleshooting](docs/troubleshooting.md) first, then open
 a new issue with the form that fits:
 
 - **Bug report**: something goes wrong in the game.
@@ -23,7 +23,8 @@ A report that can be acted on has the version or commit, how you installed
 (installer or source build), your operating system, CPU, GPU and controller, the
 steps to reproduce, and the relevant log lines. A source build writes
 `logs/run-*.log.err`; the installer writes to `%LOCALAPPDATA%\DefJamSetup\logs`.
-Remove personal paths before posting. Screenshots of the problem are welcome.
+Remove personal paths before posting. Keep captures and raw recorder bundles local;
+share permitted textual diagnostics rather than game pictures/audio.
 
 Report security problems privately: see [SECURITY.md](SECURITY.md).
 
@@ -32,7 +33,7 @@ Report security problems privately: see [SECURITY.md](SECURITY.md).
 1. Build the game from source with the [build guide](docs/build-and-play.md)
    (or [macOS and Linux](docs/build-macos-linux.md)). You need your own dump of
    the supported USA Xbox version.
-2. Install the test dependencies: `python -m pip install pytest pyxbe capstone Pillow numpy`.
+2. Install the test dependencies: `python -m pip install pytest pyxbe capstone Pillow numpy cryptography`.
 3. Read [workflows](docs/03-workflows.md) for the pipeline, diagnostics and
    troubleshooting, and the [runtime reference](docs/05-reference.md) for how
    rendering and the investigation tools work.
@@ -78,14 +79,19 @@ checks below.
 
 ### With a local build
 
-| Change touches | Run |
+| Change touches | Run on the pull request |
 |---|---|
 | Docs, unit-tested scripts | the two commands above |
-| `src/`, settings, input, launcher or overlay | `python scripts/regress.py --quick` (about 10 minutes) |
-| Runtime, renderer, translator or generated code; a toolkit pin change | `python scripts/regress.py` (about an hour), on the Release preset |
-| Translator (lifter) changes | the full run, plus the toolkit's compiled CPU tests: `python scripts/test-toolkit-msvc.py` |
-| A toolkit migration | the full run on both Debug and Release, plus a boot soak (`--only soak --soak 20`) |
+| `src/`, settings, input, launcher or overlay | `python scripts/regress.py --quick` (about 10 minutes) on the platform the change targets |
+| Runtime, renderer, translator or generated code; a toolkit pin change | `--quick`, plus `python scripts/regress.py --only <checks>` for the area, on the Release preset |
+| Translator (lifter) changes | the same, plus the toolkit's compiled CPU tests: `python scripts/test-toolkit-msvc.py` |
+| A toolkit migration | one full `python scripts/regress.py` (about an hour) on one platform, plus a boot soak (`--only soak --soak 20`) |
 | Installer | `scripts/build-setup.ps1`, the setup unit tests, and one real installation from a dump |
+
+The full `python scripts/regress.py` runs once per platform on each release
+candidate, after the queued pull requests are combined, so a pull request does
+not repeat it. [Releasing](docs/releasing.md) describes the release trains and
+[the release playbook](docs/agent/release.md) lists the `--only` checks per area.
 
 `python scripts/regress.py --help` lists the checks, and `--only a,b` runs a
 subset. `python scripts/scenario_suite.py run <route> --fixture <folder>` plays
@@ -113,12 +119,17 @@ could not run a game test, say so; the maintainer will run it.
 - Describe the symptom, the change and how you tested it.
 - Use commit subjects such as `fix(audio): ...`, `feat(input): ...`, `docs: ...`.
 - Keep existing license notices, and disclose AI assistance where it was used.
-- Update the guides your change affects, and add a line to
-  [known issues](docs/known-issues.md) if you leave a limitation behind.
+- Update the guides your change affects. Link remaining limitations to an existing
+  GitHub issue or open one with concrete evidence; preserve release qualifications
+  in the versioned release notes.
+- Feature branches leave `PROGRESS.md` alone and put decisions/results in the PR
+  description. Main-only documentation PRs maintain the relevant progress sections. A change to the game, setup or launcher is queued for a release
+  (the maintainer sets its milestone) and merges with the other queued changes
+  once the release candidate passes; see [releasing](docs/releasing.md).
 
-The only images in the repository are the README visuals in `docs/media/`,
-approved by the owner: two of gameplay and two of the port's own interface. CI
-checks their exact fingerprints; new media needs the owner's review. Game artwork is not covered by the MIT license.
+Approved media in `docs/media/` and artwork in `branding/` have exact fingerprints
+checked by `scripts/check-source-tree.py`. Changes follow that approved-path policy;
+new media requires owner review. Game artwork is not covered by the MIT license.
 
 Upstream pull requests to `sp00nznet/xboxrecomp` on the project's behalf are
 opened by the maintainer, or with the maintainer's approval for each one.

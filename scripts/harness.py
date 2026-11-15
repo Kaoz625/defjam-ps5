@@ -31,10 +31,12 @@ import argparse
 from datetime import datetime, timezone
 import filecmp
 import importlib.util
+import json
 import math
 import os
 import re
 import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -44,6 +46,9 @@ import zlib
 from pathlib import Path
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_profile_spec = importlib.util.spec_from_file_location('regression_profile', os.path.join(REPO, 'scripts/regression_profile.py'))
+regression_profile = importlib.util.module_from_spec(_profile_spec)
+_profile_spec.loader.exec_module(regression_profile)
 # Windows builds with the win-x64 presets; every other host with the posix ones.
 WINDOWS = os.name == "nt"
 EXE_NAME = "defjam_recomp.exe" if WINDOWS else "defjam_recomp"
@@ -63,10 +68,22 @@ BASE_ENV = {
     "RECOMP_USB": "1",
     # A player's settings.ini must never change a test run: defaults only, nothing written.
     "RECOMP_SETTINGS": "none",
+    # Reviewed goldens/replays use the original canvas, independent of player defaults.
+    "RECOMP_ASPECT": "4:3",
 }
 
-# The front end's flow file loads twice; the second load is the title screen.
-TITLE_ANCHOR = "feflow.xml#2"
+# A screen request works with both normal and shortened startup. Counting flow
+# file opens does not: skipping legal/bootLoad also skips the first flow load.
+TITLE_ANCHOR = "getscreeninfo(intmain/prestart"
+
+
+def startup_default(e):
+    """Shorten test boots; explicit 0 keeps normal startup, empty uses the INI/default."""
+    if "RECOMP_SKIP_INTRO" not in e:
+        e["RECOMP_SKIP_INTRO"] = "1"
+    elif e["RECOMP_SKIP_INTRO"] == "":
+        del e["RECOMP_SKIP_INTRO"]
+    return e
 
 
 def unlock_default(e):
@@ -253,6 +270,29 @@ SECOND_MATCH_FFA = raw_stages([
     "getscreeninfo(battle/chsvenue#2=a@8+4x4",
 ])
 
+# Repeated One on Ones for the memory check (issue #166). The runtime's pad script
+# takes at most 32 anchors and 4095 characters, which caps this at five matches.
+FIGHT_CYCLES = 5
+
+
+def fight_cycles_tail(matches):
+    """Pad-script tail for `matches` One on Ones at the default venue in one launch: each
+    match's scripted fighter, then through the summary back to the same match type and
+    fighters. Ends by holding the battle menu. Each match asks for the summary twice."""
+    def fighter(k):
+        return FIGHT_TAIL if k == 1 else FIGHT_TAIL.replace("@game.startgame(", "@game.startgame(#%d" % k)
+    parts = [fighter(1)]
+    for k in range(2, matches + 1):
+        parts += ["@game.getmatchsummary(#%d,a:4:80:3:0.3" % (2 * (k - 1) - 1),
+                  "@getscreeninfo(options/battleid#%d,start:6:30:4:0.3" % k,
+                  "@controllerbind(0#%d,a:5:40:4:0.3" % k,
+                  "@controllersetup(0#%d,right:4:4.3,a:6:90:4:0.3" % k,
+                  fighter(k)]
+    parts.append("@game.getmatchsummary(#%d,a:4:60:3:0.3" % (2 * matches - 1))
+    parts.append("@getscreeninfo(battle/cmtype#%d,back:9999:10000" % (matches + 1))
+    return ",".join(parts)
+
+
 ROUTES = {
     "boot": {
         "help": "start-up to the main menu, nothing pressed there",
@@ -281,12 +321,29 @@ ROUTES = {
         "until": "game.startgame(", "after": 150, "secs": 520,
         "shots": "@game.startgame(,60,140",
     },
+    "battle-map-edges": {
+        "help": "Free For All venue map through the eastern pins to Chop Shop and back (widescreen clip check)",
+        "stages": FFA_SETUP + [
+            "getscreeninfo(battle/chsvenue=right@7;right@13;down@19;down@25;right@31;left@37;up@43",
+        ],
+        "until": "getscreeninfo(battle/chsvenue", "after": 49, "secs": 300,
+        "shots": "@getscreeninfo(battle/chsvenue,5,11,17,23,29,35,41,47",
+        "env": {"RECOMP_TRANS_SHOT_NATIVE": "1"},
+    },
     "two-matches": {
         "help": "One on One to its result, back through the menus, then a Free For All to its result, in one launch",
         "stages": ONE_ON_ONE_SETUP + ["controllersetup(1,=a@4+4x6"],
         "tail": ",".join([FIGHT_TAIL, SECOND_MATCH_FFA, FIGHT_TAIL.replace("@game.startgame(", "@game.startgame(#2")]),
         "until": "game.getmatchsummary(#3", "after": 6, "secs": 1800,
         "shots": "@game.startgame(,60",
+    },
+    "fight-cycles": {
+        "help": "Five One on Ones at the default venue in one launch, then the battle menu held for 90 seconds "
+                "(repeated scene cycles for the memory check, issue #166)",
+        "stages": ONE_ON_ONE_SETUP + ["controllersetup(1,=a@4+4x6"],
+        "tail": fight_cycles_tail(FIGHT_CYCLES),
+        "until": "game.getmatchsummary(#%d" % (2 * FIGHT_CYCLES - 1), "after": 90, "secs": 600 * FIGHT_CYCLES,
+        "shots": "",
     },
     "versus": {
         "help": "One on One between two pads: both press START, each picks a fighter, default venue",
@@ -318,14 +375,20 @@ ROUTES = {
         "stages": FFA_SETUP + [TERRORDOME],
         "tail": FIGHT_TAIL,
         "until": "game.startgame(", "after": 240, "secs": 620,
-        "shots": "@game.startgame(,15,60,230",
+        "shots": "@getscreeninfo(battle/oldmload,1,@game.startgame(,15,60,230",
+        # Unlocking every venue changes traversal of the map. Pin the actual
+        # retail FE ID through ChooseVenue before the loading screen starts.
+        "env": {"RECOMP_FE_INJECT": "game.choosevenue#1=>Game.ChooseVenue(6)",
+                "RECOMP_START_LOG": "1"}, "expected_venue": 6,
     },
     "fight-terrordome": {
         "help": "One on One at the Terrordome (venue 6), played for four minutes",
         "stages": ONE_ON_ONE_SETUP + ["controllersetup(1,=back@9999", TERRORDOME],
         "tail": FIGHT_TAIL,
         "until": "game.startgame(", "after": 240, "secs": 620,
-        "shots": "@game.startgame(,15,60,230",
+        "shots": "@getscreeninfo(battle/oldmload,1,@game.startgame(,15,60,230",
+        "env": {"RECOMP_FE_INJECT": "game.choosevenue#1=>Game.ChooseVenue(6)",
+                "RECOMP_START_LOG": "1"}, "expected_venue": 6,
     },
     # The Story routes pick the THIRD user ID (down twice): the save area has four profiles since 2026-10-06 and the
     # second one no longer has a Story save. If profiles are added or removed, this is the number to revisit.
@@ -350,6 +413,18 @@ ROUTES = {
         ],
         "until": "getscreeninfo(story/gym", "after": 26, "secs": 300,
         "shots": "@getscreeninfo(story/gym,13,23",
+        "story": True,
+    },
+    "story-map-shops": {
+        "help": "Story map -> Shop District -> clothing and gym pins (widescreen border check, #162)",
+        "stages": [
+            "getscreeninfo(intmain/mainmenu=a@6",
+            "getscreeninfo(options/userid=down@4;down@6;a@9",
+            "getscreeninfo(story/crib=down@4;a@6;a@10;a@16;down@24",
+        ],
+        "until": "crib.entermap(", "after": 18, "secs": 300,
+        "shots": "@getscreeninfo(story/crib,13,19,26",
+        "env": {"RECOMP_TRANS_SHOT_NATIVE": "1"},
         "story": True,
     },
     "unlock": {
@@ -411,13 +486,129 @@ def trees_equal(a, b):
     return all(trees_equal(os.path.join(a, d), os.path.join(b, d)) for d in c.common_dirs)
 
 
+def _clone_save_file(src, dst):
+    """Try the macOS clonefile syscall; unsupported filesystems use the normal copy path."""
+    if sys.platform == 'darwin':
+        try:
+            import ctypes
+            clone = ctypes.CDLL(None).clonefile
+            clone.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
+            clone.restype = ctypes.c_int
+            return clone(os.fsencode(src), os.fsencode(dst), 0) == 0
+        except (AttributeError, OSError):
+            pass
+    return False
+
+
+def copy_save_file(src, dst):
+    """Clone on macOS/APFS when available; preserve independent bytes and metadata elsewhere."""
+    if _clone_save_file(src, dst):
+        shutil.copystat(src, dst)
+        return dst
+    return shutil.copy2(src, dst)
+
+
+class StaleSaveGuard(RuntimeError):
+    """An earlier guard never finished: the live save may not be the player's original."""
+
+
+def pid_alive(pid):
+    if sys.platform == "win32":
+        import ctypes
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(pid))   # QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        code = ctypes.c_ulong()
+        ok = ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return bool(ok) and code.value == 259                                   # STILL_ACTIVE
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def unresolved_guards(root):
+    """Stamps in `save-guard/` whose run never put the save back, as (name, state), oldest first.
+
+    A guard writes `state.json` into its stamp when it starts and removes it after a verified
+    restore. A stamp that still has one was interrupted (its harness was killed, as when a display
+    server dies under it), failed to restore, or is still running; game runs are serial, so a
+    running one blocks a new guard as well. Stamps made before this marker existed carry none and
+    are not judged."""
+    found = []
+    for name in sorted(os.listdir(root)) if os.path.isdir(root) else []:
+        marker = os.path.join(root, name, "state.json")
+        if not os.path.isfile(marker):
+            continue
+        try:
+            with open(marker, encoding="utf-8") as f:
+                state = json.load(f)
+        except (OSError, ValueError):
+            state = {"state": "open"}
+        kind = state.get("state", "open")
+        if kind == "open" and state.get("pid") and pid_alive(state["pid"]):
+            kind = "running"          # its harness is still going, or still restoring after its display died
+        found.append((name, kind))
+    return found
+
+
+def mark_guard_ok(root, name):
+    status_root = os.path.join(root, ".status")
+    os.makedirs(status_root, exist_ok=True)
+    open(os.path.join(status_root, name + ".ok"), "w").close()
+
+
+def save_equals_payload(save, payload):
+    """Whether the live save is what the guard copied (both absent counts as equal)."""
+    have_payload = os.path.isdir(payload) and bool(os.listdir(payload))
+    if not os.path.isdir(save):
+        return not have_payload
+    return have_payload and trees_equal(save, payload)
+
+
+def resolve_guards(data_root, mode=None):
+    """Settle the unresolved guards of a data folder; returns the names still unresolved.
+
+    No mode: only the ones whose payload equals the live save (nothing was lost). `restore`: put
+    the oldest payload back first, which is the save as it was before the first interrupted run.
+    `accept`: take the live save as the original."""
+    root = os.path.join(data_root, "save-guard")
+    save = os.path.join(data_root, "save")
+    stale = unresolved_guards(root)
+    if mode == "restore" and stale and not any(state == "running" for _, state in stale):
+        payload = os.path.join(root, stale[0][0], "payload")
+        if os.path.isdir(save):
+            shutil.rmtree(save)
+        if os.path.isdir(payload) and os.listdir(payload):
+            shutil.copytree(payload, save)
+    left = []
+    for name, state in stale:
+        if state == "running":
+            left.append(name)                     # never settled under a harness that is still at work
+        elif mode or save_equals_payload(save, os.path.join(root, name, "payload")):
+            if state == "open":
+                mark_guard_ok(root, name)         # nothing left to protect: let it age out
+            os.remove(os.path.join(root, name, "state.json"))
+        else:
+            left.append(name)
+    return left
+
+
 class SaveGuard:
     """Copy the save area aside, and put it back when the block ends.
 
     The copies live beside the save area (`save-guard/<stamp>`), not in the repo,
     and the three most recent are kept: a scripted run uses the player's own
     profile, and a guard that failed to restore must leave something to restore
-    from by hand."""
+    from by hand.
+
+    A guard that was killed before it restored leaves the save changed, and the next guard
+    would copy the changed save as the original. So a guard refuses to start while an earlier
+    one is unresolved (see `unresolved_guards`); `harness.py save-recover` settles it."""
 
     def __init__(self, data_root=None):
         self.data_root = data_root or data_dir()
@@ -426,6 +617,10 @@ class SaveGuard:
         self.backup = None
         self.restored_equal = None
         self.existed = False
+        self._signals = {}
+
+    def _on_signal(self, number, frame):
+        raise SystemExit(128 + number)      # unwinds through the caller's `finally`, which restores
 
     def __enter__(self):
         self.existed = os.path.isdir(self.src)
@@ -433,23 +628,41 @@ class SaveGuard:
             raise RuntimeError("save root is not a directory: " + self.src)
         root = os.path.join(self.data_root, "save-guard")
         os.makedirs(root, exist_ok=True)
+        left = resolve_guards(self.data_root, os.environ.get("DEFJAM_HARNESS_SAVE_RECOVERY") or None)
+        if left:
+            raise StaleSaveGuard(
+                "an earlier run did not put the save back, or is still doing so (%s in %s); the save may "
+                "be changed. Wait for it, then run `python scripts/harness.py save-recover` to see which, "
+                "and `--restore` to put back the oldest copy or `--accept` to keep the save as it is"
+                % (", ".join(left), root))
         self.backup = tempfile.mkdtemp(prefix=time.strftime("%Y%m%d-%H%M%S-"), dir=root)
         self.copy = os.path.join(self.backup, 'payload')
         os.mkdir(self.copy)
+        with open(os.path.join(self.backup, "state.json"), "w", encoding="utf-8") as f:
+            json.dump({"state": "open", "pid": os.getpid(), "started_utc": datetime.now(timezone.utc).isoformat()}, f)
         if self.existed:
-            shutil.copytree(self.src, self.copy, dirs_exist_ok=True)
+            shutil.copytree(self.src, self.copy, dirs_exist_ok=True, copy_function=copy_save_file)
+        for name in ("SIGTERM", "SIGHUP"):
+            number = getattr(signal, name, None)
+            if number is not None:
+                try:
+                    self._signals[number] = signal.signal(number, self._on_signal)
+                except ValueError:
+                    pass                    # not the main thread
         return self
 
     def __exit__(self, *exc):
         if not self.copy:
             return False
+        for number in self._signals:
+            signal.signal(number, signal.SIG_IGN)     # a second kill must not stop the restore half way
         kill_stray()
         # DEFJAM_HARNESS_SNAPSHOT_SAVE=<dir>: keep what the run wrote, before the restore
         # puts the original back (a profile the game itself produced, e.g. with RECOMP_UNLOCK_ALL).
         snapshot = os.environ.get("DEFJAM_HARNESS_SNAPSHOT_SAVE")
         if snapshot and os.path.isdir(self.src):
             shutil.rmtree(snapshot, ignore_errors=True)
-            shutil.copytree(self.src, snapshot)
+            shutil.copytree(self.src, snapshot, copy_function=copy_save_file)
         for attempt in range(5):
             try:
                 if os.path.isdir(self.src):
@@ -457,7 +670,7 @@ class SaveGuard:
                 elif os.path.lexists(self.src):
                     os.remove(self.src)
                 if self.existed:
-                    shutil.copytree(self.copy, self.src)
+                    shutil.copytree(self.copy, self.src, copy_function=copy_save_file)
                 break
             except OSError:
                 time.sleep(1.0)
@@ -466,18 +679,25 @@ class SaveGuard:
                                    else not os.path.exists(self.src))
         except OSError:
             self.restored_equal = False
+        for number, old in self._signals.items():
+            signal.signal(number, old)
+        self._signals = {}
         root = os.path.dirname(self.backup)
+        marker = os.path.join(self.backup, "state.json")
         # Preserve failed backups even after later successful runs.
         if self.restored_equal:
+            os.remove(marker)
+            mark_guard_ok(root, os.path.basename(self.backup))
             status_root = os.path.join(root, '.status')
-            os.makedirs(status_root, exist_ok=True)
-            open(os.path.join(status_root, os.path.basename(self.backup) + '.ok'), 'w').close()
             successful = [d for d in sorted(os.listdir(root))
                           if os.path.isfile(os.path.join(status_root, d + '.ok'))]
             for old in successful[:-3]:
                 shutil.rmtree(os.path.join(root, old), ignore_errors=True)
                 if not os.path.exists(os.path.join(root, old)):
                     os.remove(os.path.join(status_root, old + '.ok'))
+        else:
+            with open(marker, "w", encoding="utf-8") as f:
+                json.dump({"state": "restore-failed", "pid": os.getpid()}, f)
         return False
 
 
@@ -506,6 +726,13 @@ def read_log(path):
 
 
 PRESENT_RE = re.compile(r"\[D3D\] 2\.0s: (\d+) present")
+LAST_LOG = None          # the .log.err of the most recent run_game, so a caller can point at it
+
+
+def triage_hint(log):
+    """The command that digests a run log; the first thing to run on a failed one."""
+    rel = os.path.relpath(log, REPO)
+    return "python scripts/triage.py %s" % rel.replace(os.sep, "/")
 
 
 def summarise(text):
@@ -666,7 +893,7 @@ def run_game(name, stages=(), tail="", shots="", secs=240, preset=RELEASE_PRESET
         raise SystemExit("not built: %s (scripts/build.ps1 -Preset %s, or scripts/pipeline.py build --preset %s)"
                          % (exe, preset, preset))
     try:
-        build_state = pipeline_state.verify_build(Path(REPO), preset)
+        build_state = pipeline_state.verify_build(Path(REPO), preset, python=pipeline_state.RECORDED)
     except (OSError, ValueError, KeyError) as ex:
         raise SystemExit(str(ex)) from ex
     if not os.path.exists(os.path.join(REPO, "game", "default.xbe")):
@@ -684,6 +911,9 @@ def run_game(name, stages=(), tail="", shots="", secs=240, preset=RELEASE_PRESET
 
     e = {k: v for k, v in os.environ.items() if inherit_recomp or not k.upper().startswith('RECOMP_')}
     e.update(BASE_ENV)
+    profile = regression_profile.current()
+    if profile:
+        e.update(profile['environment'])
     e["DEFJAM_DATA"] = data_dir()
     if scripted:
         e["RECOMP_SCRIPT_ANCHOR"] = TITLE_ANCHOR
@@ -693,10 +923,12 @@ def run_game(name, stages=(), tail="", shots="", secs=240, preset=RELEASE_PRESET
         e["RECOMP_TRANS_SHOT_SECS"] = shots
     e.update(env or {})
     unlock_default(e)
+    startup_default(e)
     e['DEFJAM_DATA'] = guarded_data_root(e['DEFJAM_DATA'])
 
     run = Run(name, log + ".err", shots_dir)
     run.identity = {'preset': preset, 'executable': exe, 'build_state': build_state,
+                    'regression_profile': profile,
                     'environment': {k: v for k, v in e.items() if k.startswith('RECOMP_')},
                     'data_root': e['DEFJAM_DATA'], 'started_utc': datetime.now(timezone.utc).isoformat(),
                     'inherits_recomp_environment': inherit_recomp,
@@ -766,6 +998,8 @@ def run_game(name, stages=(), tail="", shots="", secs=240, preset=RELEASE_PRESET
         run.save_ok = guard.restored_equal
     run.text = read_log(run.log)
     run.summary = summarise(run.text)
+    global LAST_LOG
+    LAST_LOG = run.log
     if not quiet:
         print_run(run)
     return run
@@ -803,6 +1037,7 @@ def print_run(run):
     faults = run_faults(run)
     if faults:
         print("FAIL     " + "; ".join(faults))
+        print("triage   " + triage_hint(run.log))
     if s['baseline_noops']:
         print("baseline %d reported verified inherited omissions" % s['baseline_noops'])
     for f in run.shots():
@@ -861,7 +1096,7 @@ DIR_RE = re.compile(r'\[DIR\] .* pattern "([^"*?]+)" -> 0x00000000 (?:dir|file) 
 
 def run_faults(run):
     """Shared failure policy for routes, goldens, standalone runs and soaks."""
-    out = []
+    out = regression_profile.faults(run)
     for key, label in (("crashes", "[CRASH]"), ("watchdogs", "[WATCHDOG]"),
                        ("debug_layer", "[D3D11-DEBUG]"), ("truncated", "truncated batches"),
                        ("icall_failures", "unresolved indirect calls"),
@@ -964,6 +1199,11 @@ def main(argv=None):
     s.add_argument("--preset", default=os.environ.get("RECOMP_PRESET", DEBUG_PRESET))
     s.add_argument("--keep-going", action="store_true", help="do not stop at the first hang")
 
+    v = sub.add_parser("save-recover", help="list, or settle, runs that did not put the save back")
+    g = v.add_mutually_exclusive_group()
+    g.add_argument("--restore", action="store_true", help="put back the oldest unresolved copy (the save before the first interrupted run)")
+    g.add_argument("--accept", action="store_true", help="keep the save as it is and forget the unresolved copies")
+
     p = sub.add_parser("png", help="convert captures to PNG for viewing")
     p.add_argument("bmp", nargs="+")
 
@@ -989,6 +1229,25 @@ def main(argv=None):
     if a.cmd == "soak":
         ok, hung, failed = soak(a.boots, a.preset, stop_on_hang=not a.keep_going)
         return 1 if (hung or failed) else 0
+    if a.cmd == "save-recover":
+        root = os.path.join(data_dir(), "save-guard")
+        stale = unresolved_guards(root)
+        if not stale:
+            print("no unresolved save guard in %s" % root)
+            return 0
+        save = os.path.join(data_dir(), "save")
+        for name, state in stale:
+            same = save_equals_payload(save, os.path.join(root, name, "payload"))
+            print("%-28s %-14s save %s this copy" % (name, state, "equals" if same else "DIFFERS from"))
+        if all(state == "running" for _, state in stale):
+            print("still running: wait for it (exit status 3)")
+            return 3
+        if not (a.restore or a.accept):
+            print("rerun with --restore (oldest copy back) or --accept (keep the save as it is)")
+            return 1
+        left = resolve_guards(data_dir(), "restore" if a.restore else "accept")
+        print("save %s" % ("restored from %s" % stale[0][0] if a.restore else "accepted as it is"))
+        return 1 if left else 0
     if a.cmd == "png":
         for f in a.bmp:
             print(bmp_to_png(f))

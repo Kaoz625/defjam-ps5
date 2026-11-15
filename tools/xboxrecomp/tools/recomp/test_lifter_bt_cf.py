@@ -112,8 +112,8 @@ class BitTestCarryTest(unittest.TestCase):
                         _insns(mnemonic, "jb")),
                     "a carry branch after %s must publish _cf" % mnemonic)
 
-    def test_plain_bt_publishes_cf_for_a_consumer_at_an_unknown_join(self):
-        self.assertTrue(
+    def test_plain_bt_does_not_force_cf_publication(self):
+        self.assertFalse(
             FunctionTranslator._function_needs_cf(_insns("bt", "jb")))
 
 

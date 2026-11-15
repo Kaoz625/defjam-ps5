@@ -1,10 +1,14 @@
 # HD textures: support and local workflow
 
+New to making packs? Start with [Texture Modding — Getting Started](texture-modding-getting-started.md)
+for a capture-to-pack walkthrough. This page is the format and processing reference.
+
 v0.6.0 added optional Windows Direct3D 11 texture packs and local
 Lanczos 4x generation; v0.6.1 draws the same packs through Vulkan on macOS
 (Apple Silicon), and v0.7.2 offers them in the Linux setup (the Steam Deck included),
-whose Vulkan renderer is the macOS one. Widescreen, vector fonts and HD movies remain
-follow-ups. See `research/hd-textures-notes.md` for evidence and gaps.
+whose Vulkan renderer is the macOS one. Compatible menu packs add optional
+wide background extensions when a compatible pack is loaded; vector fonts and HD
+movies remain follow-ups. See [the HD acceptance record](research/hd-v060-release-validation.md) for dated evidence and coverage limits.
 
 A pack is named by the contents of the original texture, not by the renderer, so the
 packs Setup makes on a Mac or on Linux are the same files (18,971 images, 6,212,168,677
@@ -14,7 +18,7 @@ bytes) as on Windows, and a pack made on one can be used on the others.
 
 Run the Windows setup (`DefJamSetup-<version>-windows-x64.exe`), the macOS setup
 (`DefJamSetup-<version>-macos-arm64.dmg`, v0.6.1 or newer) or the Linux setup
-(`DefJamSetup-<version>-linux-x64.tar.gz`, v0.7.2 or newer) with your supported USA Xbox
+(`DefJamSetup-<version>-linux-x64.tar.gz`, v0.7.2 to v0.13.0; since 1.0.0 the Linux app) with your supported USA Xbox
 dump and select **Apply HD texture upscale during install (increases install time)**.
 The option starts unchecked. Setup generates the textures on your CPU after
 building the game, then enables the generated packs for the first launch.
@@ -28,12 +32,12 @@ Generation took about four minutes on the development PC; game compilation and
 texture verification add time, and other CPUs may take longer. On a Steam Deck the upscale
 takes about ten minutes, and the whole install with it about 15.
 
-The first time a screen is drawn with the packs, its HD textures are decoded and uploaded
-(the main menu's are 2048x2048), so it can take a moment to respond: about 3 s for the main
-menu on a Steam Deck. On the Deck a one-on-one fight runs at 60 frames a second with the packs
-and a four-fighter Free For All at about 56 (both 60 without them).
+Replacement decoding/upload can add work when a screen first appears. The runtime
+uses background preparation where supported and displays originals until replacements
+are ready. Historical synchronous-load timings are not current performance guarantees;
+measure the exact build, packs, cache, venue and display settings.
 
-In the launcher or F1 overlay (Windows, macOS since v0.6.2, Linux since v0.7.0), open **Textures** to disable HD
+In the launcher or F1 overlay (Windows, macOS since v0.6.2, Linux since v0.7.0), open **Mods** to disable HD
 packs, change the pack list or adjust the cache. Restart after changes. Or edit `[textures]` in
 `settings.ini` in your data folder (`enabled=0` turns the packs off, `enabled=1` on; `packs` and
 `cache_mb` are the pack list and memory budget; the [settings reference](settings-reference.md) lists
@@ -55,15 +59,20 @@ For manual generation, review galleries and future processing experiments, see
 
 ## Install and enable a pack
 
-Put the pack beneath the data folder, then use the launcher's or overlay's **Textures** page:
+Put the pack beneath the data folder, then use the launcher's or overlay's **Mods** page:
 
 ```text
 <data>/mods/faithful-hd/manifest.ini
 <data>/mods/faithful-hd/textures/<source-id>.png
 ```
 
-Turn **Use HD texture packs** on, enter `faithful-hd` under **Pack folders**, and restart the game.
-Multiple names use semicolons; the last listed pack wins. Turn packs off and restart to restore original
+Choose **Refresh local mods**, turn **Use HD texture packs** on, enable the pack and restart the game.
+The current **Load Order…** window shows highest priority at the top; use **Higher** to make a pack
+override matching textures in the packs below it. For manual configuration, **Pack folders** is under
+**Memory and manual pack list** and uses the stored order described below.
+Multiple names use semicolons; the last listed pack wins. The list holds up to 1023 characters; a longer
+one is reported in the log as a `[SETTINGS]` line and no pack loads until it is shortened. (Up to v0.10.5
+the limit was 95 characters, which a setup install with one added pack already passed.) Turn packs off and restart to restore original
 textures. A missing, unsupported or malformed replacement falls back to the original with a bounded log.
 Explicit `RECOMP_TEXTURE_PACKS=faithful-hd` enables that pack for a diagnostic run. `RECOMP_TEXTURE_ROOT`
 can override the default `<data>/mods` directory. Use packs with the game closed while rebuilding them.
@@ -95,7 +104,7 @@ BC7, DX10 headers, arrays, cubes and volumes are unsupported. DDS replacements f
 row padding currently fall back. Use PNG to keep alpha exact during review; use DirectXTex `texconv`
 only after choosing suitable compression/mips per material. No automatic sRGB format change is made.
 
-The cache defaults to 512 MiB, accounting for retained upload data and GPU texture bytes. It protects
+The cache defaults to 2048 MiB, accounting for retained upload data and GPU texture bytes. It protects
 textures bound on all four stages when evicting; temporary pressure falls back and retries. Cube maps,
 YUV/movie and depth formats and tracked render surfaces stay on their original path. Generated text
 is not approved for static replacement. Restart is required to reload manifests or edited files.
@@ -116,83 +125,20 @@ identity uses format 0x12, tight BGRA pixels and no palette for comparing archiv
 The native fixture shares a known-answer vector with Python, and checks mutations outside the old sampled
 signature as well as palette changes and address independence.
 
-## Local automated workflow
+## Authoring and comparison tools
 
-For local HD captures, `RECOMP_TRANS_SHOT_NATIVE=1` writes actual rendered pixels instead of the
-standard 640x480 regression capture. At render scale 2/4 these are 1280x960/2560x1920 respectively.
-The default capture path and existing goldens stay at 640x480. Capture work is excluded from performance
-measurements.
-
-Use an isolated Python environment with Pillow, for example `<hd-data>/tools/python`
-in a data folder of your own; it does not change the project Python installation.
-The portable official Real-ESRGAN NCNN Vulkan executable uses the local NVIDIA GPU without a CUDA/PyTorch
-installation. It and both model pairs live under `<data>/tools/realesrgan`. Reproduction downloads and
-hashes are in the research notes. chaiNNer is an optional GUI for auditioning and editing recipes.
-
-```powershell
-$hdData = 'D:\Games\DefJam\HdData'   # your own folder
-$hdPython = "$hdData\tools\python\Scripts\python.exe"
-$hdGpu = "$hdData\tools\realesrgan\realesrgan-ncnn-vulkan.exe"
-
-# Full metadata census; export a bounded selection for inspection.
-& $hdPython scripts/hd_assets.py inventory --root "$hdData\extracted" --output "$hdData\hd-work" --select load0 --select pause --limit 50
-
-# Build grouped, resumable jobs from observed runtime IDs.
-& $hdPython scripts/hd_assets.py batch --runtime "$hdData\hd-work\runtime" --inventory "$hdData\hd-work\inventory.json" --recipes config/hd-recipes.example.json --output "$hdData\mods\faithful-hd" --tool $hdGpu
-```
-
-Recipes contain category defaults and individual overrides. The example approves only three observed UI
-assets for a pilot; unapproved/unknown captures go to `review.json`. Category classification by archive
-name is a suggestion, not evidence of material/alpha semantics. Approve category defaults after reviewing
-representative assets; retain individual exclusions and overrides. Source archive IDs are provisional:
-the game may transform pixels or palettes before upload. Runtime IDs are authoritative for replacement.
-
-Each job splits RGB and alpha, optionally extends colour into fully transparent pixels, pads eight source
-pixels by default, runs RGB inference at 4x, crops 32 output pixels, optionally reduces to 2x, then recombines
-separately resized alpha. Edge padding is for clamped axes; wrapping must be confirmed per axis. `alpha=nearest`
-is available for masks that require it. Inference uses one worker and 128px tiles; inspect tile boundaries.
-`build.json` records source/output hashes, model and executable hashes, runner hash, recipe and job time.
-Unchanged outputs resume; changed source, recipe, implementation or output invalidates the job.
-
-| Category | Initial direction | Review |
-|---|---|---|
-| Logos and branded lettering | Conventional 4x reference; original vectors where available | Shapes, spelling, intentional wear |
-| UI/HUD/icons | Conservative 4x RGB, opacity handled separately | Atlas gutters, halos, layout |
-| Fighters/clothes/tattoos | Compare 2x/4x conservative models | Faces and original designs; no face restoration |
-| Create-player customization | Separate shared/body/clothing atlas review | Preserve part/colour variants and UV metrics |
-| Crowds/cinematic variants | Keep separate provenance and recipes | Consistent appearance across variants |
-| Venues/props | Start 2x; selected 4x | Actual wrap axes, seams, distance shimmer |
-| Particles/decals/masks | Separate material recipes or passthrough | Blend intensity, alpha-test coverage, channel meaning |
-| Animated textures | Same recipe across the whole sequence | Timing and temporal consistency |
-| Fonts | Original TTF outlines first; inspect FntX bitmap atlases | Metrics, kerning, counters; dynamic text remains live |
-| Video | Separate extraction and short-clip pilot | Cadence, aspect, flicker, audio |
-
-`v2ip.viv` holds named fighter atlases (for example House=`V2IP_003A`, D-Mob=`V2IP_014A/B` in
-fighter.xml). `v2cp_*.viv` is create-player customization, proven by createplayer_parts.xml;
-the generic `V2CP_A_A/cp_a` atlas is not established as a face texture. `icrowd/cincrowd/v2cm`
-are crowd sources. `v2bg` includes fight venues and Story/shop interiors; `V_ENV` environment
-maps need distinct handling. Full archive provenance takes precedence over embedded texture names.
-
-For fonts that exist only as bitmaps, compare 8x smoothing, threshold/Potrace outlines and 4x Cairo rasterizing.
-Do not trace existing TTF outlines. Preserve each glyph's original metrics and atlas placements, and convert
-Cairo's premultiplied output to straight alpha. Font runtime integration remains a separate investigation.
-
-## Representative comparison
-
-For the 40-image visual audition, see `research/hd-representative-review.md` and
-`scripts/hd_review.py`. Its local gallery compares original, Lanczos, RealESRNet
-and RealESRGAN at 2x/4x and exports independent choices at each scale. This is a
-review corpus; runtime correlation and in-game world acceptance remain required.
-
-The first Lanczos in-game pilot covers Blaze, 22 opaque Foundation venue textures and three loading
-assets, with authoritative runtime IDs and an explicit independent-channel mip policy. The local pack
-is `<data>/mods/lanczos-test`; details and run evidence are in `research/hd-lanczos-game-pilot.md`.
-It is a bounded test pack, not full-game asset coverage or release acceptance. User requested Lanczos
-tests now and deferred deeper upscaler research/review.
+Use [DefJam Modding Tools](https://github.com/vyanhursky/DefJam-Modding-Tools)
+for extraction, atlas review, original/Faithful/restored comparisons and optional
+upscale experiments. Its `defjam-tools assets`, `corpus`, `audition` and `swinir`
+commands replace the former authoring scripts in this repository. Keep recipes,
+corpora, generated candidates and review state in the private workspace. See the
+[workflow boundary](hd-texture-workflow.md) and the tools' command help.
 
 ## Movies and original fonts
 
 ```powershell
+$hdPython = "python"
+$hdData = "D:\DefJamData" # your existing data folder
 & $hdPython scripts/hd_assets.py export --root "$hdData\extracted" --output "$hdData\video-scratch\originals" --kind video --limit 3
 & $hdPython scripts/hd_assets.py export --root "$hdData\extracted" --output "$hdData\hd-work\fonts" --kind fonts --limit 24
 ```
@@ -210,18 +156,43 @@ the game's timing, skips, loops and audio while presenting host-decoded frames. 
 UI assets rather than these prerecorded videos. No movie decoder or host playback change is implemented here.
 
 
-## Full Lanczos corpus gallery
+## Corpus and acceptance evidence
 
-Owner selected Lanczos after the SwinIR audition. `scripts/hd_corpus.py build`
-processes the supported static census at4x and retains all source aliases;
-`serve --output <local-corpus-root> --port 8767` provides searchable categories,
-original comparisons and locally saved concern flags/notes. See
-`research/hd-full-lanczos-corpus.md` for full commands, counts and verification.
-The generated gallery and all images/reviews stay in the data root. Runtime
-correlation and remaining release gates precede installation of the whole corpus.
+General extraction/review galleries and optional processing live in
+[Modding Tools](https://github.com/vyanhursky/DefJam-Modding-Tools).
+The game keeps its frozen Setup generator and runtime aliases for compatibility;
+do not replace that snapshot as part of authoring cleanup. The
+[v0.6 acceptance record](research/hd-v060-release-validation.md) distinguishes
+prototype controls, static gallery review and later packaged-install acceptance.
+Generated images, galleries and authoring history remain private/local.
+
+## Download independent menu mods through the launcher
+
+The signed project catalogue is available in Mods. Refresh the catalogue,
+download/install a compatible version, then enable the pack and give it higher
+priority than Recomp HD in Load Order. Testing versions require an explicit opt-in.
+The menu pack is separate; Faithful generation stays optional. No manual mod ZIP extraction
+is needed. See [mod management](mod-manager.md) and the
+[original integration acceptance record](research/integrated-menu-launcher-rc-2026-10-23.md).
+That record describes the initial RC; current release behavior is documented above.
 
 
-Owner accepts the full static Lanczos gallery (D91). For exact storage, proposed
-source-only local generation and remaining runtime assembly steps, see
-[release packaging](research/hd-texture-release-packaging.md). Reusable commands,
-model experiments and saved-review behavior are in [workflow guide](hd-texture-workflow.md).
+## Wide-layer authoring contract
+
+A schema-1 pack may combine `[textures]` replacements with `[wide]` side slabs/stretch registrations. The game's foreground/layout and source identities remain live. Slabs must match their native center, sampled UV rectangle, alpha semantics and draw placement; preserve original padding and geometry. Manifest slab offsets are integer source texels: fractional source UV spans must be accounted for without emitting fractional offsets. Native acceptance covers transitions, masks, scrolling, overlays and each supported aspect. Title and Mode Select lighting require native checks independently of artwork approval. Authoring/export procedures belong in [Modding Tools](https://github.com/vyanhursky/DefJam-Modding-Tools).
+
+
+## Runtime correlation and immutable generated packs
+
+Archive identities alone do not establish runtime coverage: the guest may transform pixels, format, palette or row width. Correlation uses full decoded RGBA, including alpha, and the five-field descriptor above; legacy four-field census IDs must not be installed as verified runtime keys. One accepted PNG can serve several independently verified runtime IDs. The frozen Setup mapping adds 13 exact runtime aliases to canonical source keys, producing 18,984 manifest entries from 18,971 PNGs; this bounded mapping is not exhaustive renderer coverage. Keep that snapshot and its runtime aliases unchanged until an explicitly tested pin update.
+
+Setup's generated opacity and material-channel packs use `faithful-hd-<recipe-id-prefix>-opacity` and `...-channels`. A changed processing source revision changes the recipe prefix. The builder verifies input/code recipes, dimensions and output hashes, then publishes owned manifests atomically. Hard links avoid a second physical PNG copy where supported; copying is the fallback. Cache repair publishes a new PNG path rather than modifying a shared hard-link inode. A modified installed PNG is preserved and assembly rejects the mismatch; author manual changes in a separate overriding pack.
+
+Measured content bytes in the original review corpus were 6,212,168,677 HD PNGs, 525,848,032 decoded originals, 79,256,057 thumbnails, 20,331,619 recipe/hash records and 25,188,620 gallery/review metadata: 6,862,793,005 bytes total. These are file-content sizes, not allocation, compressed downloads or VRAM requirements. The initial prototype budget was 512 MiB; the current default is documented above. No full compression trial established a download-size saving. The accepted PNG baseline does not certify lossy DDS conversion or every alpha-test/additive/wrap/mip material.
+
+The source-only local-generation policy keeps original archives intact and distributes neither derived artwork nor a compiled game. Authoring, model experiments and private review state now belong in [Modding Tools](https://github.com/vyanhursky/DefJam-Modding-Tools); [v0.6.0 validation](research/hd-v060-release-validation.md) retains the prototype controls, artwork decision and packaged acceptance limits.
+
+
+## Source shape and identity checks
+
+A wider PNG alone cannot extend a menu: uniform 1×–8× scale validation preserves source aspect, while APT triangles/UVs, crop/padding, placement and scissor remain independent. One source identity selects one replacement, without an aspect-variant selector. Extend verified logical layers through supported wide metadata rather than relaxing source-shape validation or globally stretching all large 2Ddraws. Preserve each layer's alpha and animation, with separate masks/text/logos. The 2026-10-17 audit found only 13 bounded exact-RGBA runtime aliases; archive names/hashes were not automatically runtime IDs because palettes/swizzles may transform before binding. That count was a dated pilot scope, not a completeness guarantee. Establish new mappings through runtime capture metadata, decoded-pixel matching and reviewed aliases.

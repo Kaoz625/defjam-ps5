@@ -2,7 +2,6 @@
 from tools.recomp import config
 from tools.recomp.translator import FunctionTranslator, _merge_flag_states
 from tools.recomp.disasm import Operand
-from tools.recomp.lifter import _dynamic_condition
 
 BASE = 0x10000
 
@@ -19,12 +18,12 @@ def translate_join(consumer=bytes.fromhex('0f95c0c3')):
 
 def test_different_cmp_operands_join_for_setne():
     code = translate_join()
-    assert '(_fv & 1u) == 1u && (!_flags)' in code, code
+    assert 'CMP_NE(_fa, _fb)' in code, code
     assert '_flags /* setne */' not in code
 
 def test_different_cmp_operands_join_for_cmovne():
     code = translate_join(bytes.fromhex('0f45c7c3'))
-    assert 'if (((_fv & 1u) == 1u && (!_flags))) eax = edi;' in code, code
+    assert 'if (CMP_NE(_fa, _fb)) eax = edi;' in code, code
 
 def test_unknown_path_is_not_guessed():
     assert _merge_flag_states([None, ('cmp', [])]) is None
@@ -52,7 +51,7 @@ def test_float_compares_with_swapped_operands_join():
     # test cl,cl; jle alt; comiss xmm3,xmm0; jmp join;
     # alt: comiss xmm0,xmm3; join: jbe skip; movaps xmm0,xmm3; skip: ret
     code = translate(bytes.fromhex('84c97e050f2fd8eb030f2fc376030f28c3c3'))
-    assert _dynamic_condition('jbe') in code, code
+    assert 'if ((_fca <= _fcb || (_fca != _fca || _fcb != _fcb)))' in code, code
     assert 'if (_flags' not in code, code
 
 
@@ -60,7 +59,7 @@ def test_fcomi_family_joins():
     # fld st0; fcomip st1 on one edge, fucomip st1 on the other, then ja.
     # test cl,cl; jle alt; fcomip st(1); jmp join; alt: fucomip st(1); join: ja skip; nop; skip: ret
     code = translate(bytes.fromhex('84c97e04dff1eb02dfe97701' + '90c3'))
-    assert _dynamic_condition('ja') in code, code
+    assert 'if ((!(_fa & 1u) && !(_fa & 0x40u)) /* fucompi */)' in code, code
     assert 'if (_flags' not in code, code
 
 
@@ -79,14 +78,12 @@ def test_mixed_setters_evaluate_the_join_on_each_edge():
     # A result snapshot (sub) meets a compare snapshot (test): the states do
     # not merge, and the join used to read the never-assigned _flags.
     code = translate(bytes.fromhex('85c9740583e801eb0285c0750190c3'))
-    assert 'if (_jf_0001000B) goto loc_0001000E; /* jne: flags of incoming edge */' in code, code
+    assert 'if (_jf_0001000B /* jne' in code, code
     assert 'if (_flags' not in code, code
     # the sub edge sets it before its jmp, the test edge before falling in
-    assert ('_jf_0001000B = (' + _dynamic_condition('jne') + ') ? 1 : 0; /* flags of this edge */\n'
+    assert ('_jf_0001000B = ((_fa != 0)) ? 1 : 0; /* flags of this edge */\n'
             '    goto loc_0001000B;') in code, code
-    assignment = '_jf_0001000B = (' + _dynamic_condition('jne') + ') ? 1 : 0; /* flags of this edge */'
-    assert code.count(assignment) == 2, code
-    tail = code.index(assignment, code.index('loc_00010009:'))
+    tail = code.index('_jf_0001000B = (CMP_NE(_fa, _fb)) ? 1 : 0; /* flags of this edge */')
     assert code.index('loc_00010009:') < tail < code.index('loc_0001000B:'), code
     assert 'int _jf_0001000B = 0;' in code, code
 
@@ -96,8 +93,8 @@ def test_edges_read_snapshots_across_a_move_at_the_join():
     # before its je. Both edges read their result snapshot, not eax.
     # test ecx,ecx; jz alt; neg eax; jmp join; alt: dec ebx; join: mov eax,1; je out; nop; out: ret
     code = translate(bytes.fromhex('85c97404f7d8eb014bb801000000740190c3'))
-    assert code.count('_jf_00010009 = (' + _dynamic_condition('je') + ') ? 1 : 0;') == 2, code
-    assert 'if (_jf_00010009) goto loc_00010011; /* je: flags of incoming edge */' in code, code
+    assert code.count('_jf_00010009 = ((_fa == 0)) ? 1 : 0;') == 2, code
+    assert 'if (_jf_00010009 /* je' in code, code
 
 
 def test_a_join_with_an_unknown_predecessor_is_not_guessed():

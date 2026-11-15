@@ -24,6 +24,10 @@ unsigned failed,site;
 #define SET_LO8(r,v) ((r)=((r)&0xffffff00u)|(uint8_t)(v))
 #define SET_LO16(r,v) ((r)=((r)&0xffff0000u)|(uint16_t)(v))
 #define RECOMP_ITAIL_AT(a,s) do{failed++;site=s;}while(0)
+/* v0.16's lifter also lifts the table bytes after the jump, which never
+ * run; these let that dead code compile. */
+#define PUSH32(sp,v) do{(sp)-=4;MEM32(sp)=(uint32_t)(v);}while(0)
+#define POP32(sp,d) do{(d)=MEM32(sp);(sp)+=4;}while(0)
 '''
     functions, checks=[],[]
     cases=(('normal',bytes.fromhex('83e003'),TABLE,0),

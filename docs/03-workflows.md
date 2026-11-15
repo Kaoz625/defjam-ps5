@@ -67,7 +67,7 @@ cannot validate those control-flow joins. Use compiled recompiler tests for
 flag behavior, and retain the separate coverage and jump-table audits.
 
 ## The bring-up loop (M1 to M3)
-1. Run with the watchdog and read `logs\run-*.log`. The VEH handler prints the guest function (`sub_XXXXXXXX`), Xbox registers and a guest stack scan.
+1. Run with the watchdog, then digest the log with `python scripts/triage.py` (newest run) instead of reading `logs\run-*.log.err`, which can be hundreds of megabytes; it prints the verdict and the line numbers to slice (`--around`, `--grep`, `--lines`, `--tail`), see `docs/agent/triage.md`. The VEH handler prints the guest function (`sub_XXXXXXXX`), Xbox registers and a guest stack scan.
 2. Locate the function in `tools\xboxrecomp\tools\disasm\output\asm\` or in the Ghidra project under `$DEFJAM_DATA\ghidra`.
 3. Decide which of three fixes applies. A missing kernel or D3D shim is implemented in the toolkit and is upstream-able. A lifter bug is overridden in `src\recomp_manual.c` through `recomp_lookup_manual()`. A hardware poke we do not need (TV encoder, PCI space, interrupts) is stubbed in `src\hooks\`.
 4. Rebuild. Ninja is incremental, and generated chunks only recompile after a re-lift.
@@ -109,13 +109,38 @@ Full table with source references: `docs/research/toolkit-bringup-notes.md`. Eve
 | `RECOMP_PB_PROBE=x,y[;x,y...]` | with a batch dump: every triangle covering those pixels (up to 8), with its depth there and its depth-write, blend and stencil state -- the layers at a point, in draw order |
 | `RECOMP_GAMMA=0` | leaves out the gamma ramp the title sets at start-up (an S curve applied at presentation and to captures). The golden frames were taken without it: set this when checking them. |
 | `RECOMP_CS_TRACE_CRT`, `RECOMP_CS_WATCH` | critical-section tracing |
+| `RECOMP_RECORD=1` (or `[debug] record`, `--record`) | the play-test recorder: `logs/sessions/`, F9 bug bundles, read with `scripts/bug-bundle.py` ([guide](playtest-recorder.md)) |
+| `RECOMP_INPUT_TRACE=1` (or a CSV path), `RECOMP_INPUT_TRACE_LIMIT=N` | opt-in game/toolkit input timeline on one monotonic clock, with buffered output and explicit loss counters; default event budget 1,000,000. Requires the diagnostic hooks; [capture and analysis guide](input-latency-tracing.md). |
+| `RECOMP_INPUT_EDGES=0/1`, `RECOMP_INPUT_POLL_MS=1/2` | local input candidate: retain captured button transitions through guest/fighter consumption (game default on), with a 1 ms worker target; `0` restores legacy hold/latch handling. Hardware report and game update rates remain separate. [Details and limits](input-latency-tracing.md#local-input-correction). |
+| `RECOMP_HITCH_PROBE=1` (or milliseconds; with the recorder on, macOS) | when no frame has come for 60 ms, sample which thread holds the guest CPU, every thread's native stack, priority and CPU time, and the push-buffer executor's state, into the frame's `hitch` event and the session's `stalls.jsonl`; read with `scripts/hitch-probes.py` |
+| `RECOMP_YIELD_DEPRESS=1`, `RECOMP_EXECUTOR_QOS=0` | macOS: yield with `sched_yield()` (which drops the caller to priority 0) instead of `thread_switch()`, and run the push-buffer executor at the default QoS instead of user-interactive -- the two causes of F1's random stalls (D134), to compare |
+| `RECOMP_RECORD_SYNC=1` | the recorder reads its pictures back synchronously (as before the asynchronous read-back), to compare `capture_ms` |
+| `RECOMP_FE_INJECT="anchor#N=>command"` | send the front end's FuncCall handler a command after the Nth call containing the anchor ([scenario launching](research/scenario-launching.md)) |
+| `RECOMP_SONGS_TRACE=1` | songs: the profile's jukebox store at load (keys, states, the order counter) and every music playlist the game builds, with the store and the jukebox's list, and each piece a custom song plays ([custom songs](research/custom-songs.md)) |
+| `RECOMP_SONGS_SEGMENTS=1` | custom songs play in their map's own order (the play-time remap off, for comparison: fights then jump around the song) |
+| `RECOMP_OPTIONS_VOLUME=0` | the saved music, effects and announcer volumes are not handed to the mixer after a load (the original game's behaviour: they fall back to 85 after a restart; `src/patches/options_volume.c`) |
+| `RECOMP_TEST_SONG_SHORTCUT=next@40,start@70` | asks for the [songs] shortcuts (next song, the song from its start) that many seconds after the first frame: scripted runs have no host pads to press them with (`src/patches/song_cursor.c`) |
+| `RECOMP_TEST_SONG_CLONES=N` | test aid: N extra Song rows ("Test Song N") that play the disc's own music folders, to fill the song store (the game holds 36 rows; [limits](research/custom-songs.md#5b-slice-2-how-many-songs-the-game-can-hold-2026-11-05)) |
+| `RECOMP_TEST_SONG_ADD=folder\|title\|artist\|album` | test aid: one extra Song row for a folder the test put under `music/` |
+| `RECOMP_TEST_SONGS_ONLY=<rank or folder>` | test aid: after a profile loads, every song but the one with that record rank is disabled in memory, so the next playlist holds it alone and the main menu's song banner announces it at start-up (`32` = the restored "Holler If Ya Hear Me") |
+| `RECOMP_TEST_CROWD=hold[:N],reseed` | crowd test controls, with `RECOMP_TEST_OBSERVATIONS=1`; measured by `scripts/crowd-lab.py` |
 | `RECOMP_TICK_THREAD=0`, `RECOMP_PRECISE_SLEEP=0`, `RECOMP_GUEST_TURN_PRIO=0`, `RECOMP_GUEST_QOS=0`, `RECOMP_APU_SLICE_PACE=0` | turn off one of the audio crackle fixes (D120-D122), each on by default, to compare; `RECOMP_APU_VOICE_PCM=<prefix>` dumps voices `0xF8`-`0xFA` for `scripts/audio-holes.py` |
+| `RECOMP_PHYS_RAM_ALIAS=0` | name heap pages by their identity again (with the RAM-name record) instead of their alias in the first RAM mirror: brings back the crackle a moved heap block caused in the music stream (a translation's larger string table did it), to compare |
+| `RECOMP_PRESENT_PACING=1` | Windows: every 2 s, how evenly frames were presented (`[PACING]`), how long `Present` blocked and how long each frame stayed on screen from DXGI frame statistics (`[ONSCREEN]`; needs the monitor awake), and GPU busy/idle/finish times from timestamp queries (`[GPUTIME]`); on every platform, where the executor's time goes per frame (`[EXECTIME]`: batches, vertex gather, draw calls, present, sleep, time spent waiting for the title, frames with no sleep left, and push-buffer words by kind) |
+| `RECOMP_FLIP_KICK=0` | Windows: do not flush the frame to the GPU before the executor's 60 Hz flip sleep (the old order; with it, frames finish unevenly and judder on variable-refresh displays, #102) |
+| `RECOMP_PB_CONST_FAST=0` | turn off the executor's fast path for shader-constant words (`TRANSFORM_CONSTANT`, about 70% of a fight's push-buffer words), which skips the general method dispatch (#109) |
+| `RECOMP_GATHER_PLAN=0` | turn off the per-batch vertex-attribute plan in the GPU path and read every attribute through `fetch_attr` again (#109) |
+| `RECOMP_FAST_SIG=0` | use the single-chain texture and combiner signatures instead of the four-lane ones (#109) |
+| `RECOMP_PACE_TIMER=0` | Windows: pace flips with `Sleep()` instead of a high-resolution waitable timer; `Sleep()` is only as fine as the process's timer resolution (#109, #93) |
+| `RECOMP_FRAME_CLOCK_LOCK=0` | do not steer the title's 60 Hz frame clock towards the middle of the main loop's frames. Without the steering, a fight can run 0 and 2 simulation steps on alternate frames for up to a minute while frames still present evenly, which looks like judder (#140). `RECOMP_TEST_FRAME_CLOCK_LOCK=0` does the same through `scenario_suite.py --test-env` |
+| `RECOMP_FRAME_CLOCK_TRACE=1` | every 600 frames, how many simulation steps each frame ran (`[FRAMECLOCK]`: frames with 0, 1, 2 and 3+ steps, 0/2 alternations, the measured frame time and the steering applied); `RECOMP_TEST_FRAME_CLOCK_TRACE=1` for the harness |
 
 Game-side switches (`src/patches/dev_unlock.c`; off unless set; the test harness turns the first on):
 
 | Variable | Effect |
 |---|---|
 | `RECOMP_UNLOCK_ALL=1` | every fighter and venue on any profile, through the developers' own routine at guest `0x000158F0`; the `[debug] unlock_all` setting sets it at start-up. `0` turns it off, including for the harness. |
+| `RECOMP_SKIP_INTRO=1` | start at Press Start, bypassing startup legal and EA/THX/intro movies only. Overrides `[debug] skip_intro`; `0` restores normal boot. Harness/scenario runs default to skip enabled and use the preStart request as their anchor; m3 keeps one complete normal startup in each regression set. `regress.py --only skipintro` checks the option and both override directions. |
 | `RECOMP_DEV_DEBUG=1` | the in-fight debug label under each health bar (holds the byte at `0x0039C1DA`) |
 | `RECOMP_START_FIGHTERS=a,b[,c,d]`, `RECOMP_START_VENUE=n`, `RECOMP_START_LOG=1` | replace the fighters and venue when the match is made; see [the testing harness](09-testing-harness.md#choosing-the-fighters-and-the-venue) |
 | `DEFJAM_HARNESS_SNAPSHOT_SAVE=<dir>` | harness only: keep the save area as the run left it, before the guard restores the original |
@@ -127,6 +152,9 @@ Compile-time: `-DRECOMP_ICALL_FEEDBACK` plus `python -m tools.recomp.icall_feedb
 2. Nothing else to declare. `scripts/recomp.ps1` passes the file to the lifter with `--exclude-manual`, which scans it for `void sub_XXXXXXXX(void)` definitions and stops generating those bodies, so yours links for direct callers too.
 3. Re-run `scripts/recomp.ps1`, then rebuild. The lifter reports how many it excluded and how many it wrapped.
 
-To **wrap indirect calls**, add `extern void sub_XXXXXXXX_gen(void);` beside your definition and call it from the middle. The real body is emitted under that name, and direct call sites are also rewritten to call `_gen`, bypassing the wrapper. To observe every caller at entry, define `void sub_XXXXXXXX_enter(void)` instead and re-lift; its hook precedes guest instructions while retaining the generated body. Retired overrides can stay inside `#if 0`, which the scanner skips.
+For wrappers and entry hooks, use the canonical [lifter override playbook](agent/lifter-overrides.md).
+Since toolkit v0.16, direct callers reach a manual wrapper through the lookup too;
+the direct-call bypass described in older bring-up notes applies to v0.13 and earlier.
+Re-lift after adding a wrapper or entry hook. The scanner ignores retired overrides inside `#if 0`.
 
 Find candidates by comparing each indexed jump's table arms against its function's detected bounds: arms past the end mean the body was truncated and the lifter could not prove the jump was local, so it emitted an indirect call that fails at runtime.

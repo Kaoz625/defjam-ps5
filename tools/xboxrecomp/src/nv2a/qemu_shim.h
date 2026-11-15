@@ -375,13 +375,10 @@ static inline int64_t qemu_clock_get_ns(int type) {
     LARGE_INTEGER freq, count;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&count);
-    /* Quotient and remainder apart: count * 10^9 overflows once the counter
-     * passes 2^63 / 10^9. With a nanosecond counter (every POSIX host) that
-     * was 9.2 seconds of uptime, so this clock -- PTIMER, and the APU's global
-     * sample counter that DirectSound reads as audio time -- wrapped and ran
-     * backwards every 18 seconds. */
-    return (int64_t)((count.QuadPart / freq.QuadPart) * 1000000000LL
-                     + (count.QuadPart % freq.QuadPart) * 1000000000LL / freq.QuadPart);
+    /* Split: count * 1e9 overflows int64 after 15 minutes of uptime at a
+     * 10 MHz counter (Windows) and at once with a nanosecond one (POSIX). */
+    return (int64_t)(count.QuadPart / freq.QuadPart) * 1000000000LL +
+           (int64_t)(count.QuadPart % freq.QuadPart) * 1000000000LL / freq.QuadPart;
 }
 #define QEMU_CLOCK_VIRTUAL 0
 

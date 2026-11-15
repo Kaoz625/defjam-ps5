@@ -23,6 +23,7 @@
 
 #include "d3d8_xbox.h"
 #include "d3d8_fvf.h"
+#include "d3d8_readback.h"
 
 #include <SDL.h>
 #include <epoxy/gl.h>
@@ -975,7 +976,9 @@ static HRESULT __stdcall d3d_CreateDevice(IDirect3D8 *s, UINT adapter, DWORD dev
     (void)s; (void)adapter; (void)devtype; (void)hwnd; (void)flags;
     if (!pp || !pPP) return D3DERR_INVALIDCALL;
 
-    /* Initialise SDL video + GL 3.3 core context. */
+    /* Initialise SDL video + GL 3.3 core context. Default SIGINT/SIGTERM
+     * stay: SDL's own handlers only post an SDL_QUIT. */
+    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
     if (!SDL_WasInit(SDL_INIT_VIDEO)) SDL_InitSubSystem(SDL_INIT_VIDEO);
 
     g.backbuf_w = (int)pPP->BackBufferWidth;
@@ -1069,3 +1072,8 @@ IDirect3DDevice8 *d3d8_GetDevice(void)
 /* Used by nv2a_pb_replay to skip Present when it owns the frame. The
  * Windows backend defines this in d3d8_device.c; we mirror it here. */
 volatile int g_suppress_present = 0;
+
+/* d3d8_readback.h: this device has no asynchronous path; LockRect the back buffer. */
+int  d3d8_readback_begin(uint64_t tag) { (void)tag; return -1; }
+int  d3d8_readback_poll(D3D8Readback *out) { (void)out; return 0; }
+void d3d8_readback_reset(void) { }

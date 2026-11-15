@@ -31,6 +31,26 @@
 #include "recomp/gen/recomp_types.h"
 #include "hooks/save_compat.h"
 #include "hooks/test_observations.h"
+#include "hooks/recorder.h"
+#include "hooks/input_latency.h"
+#include "hooks/input_consumption.h"
+#include "hooks/input_late.h"
+#include "hooks/fe_inject.h"
+#include "hooks/scene_launcher.h"
+#include "hooks/dev_module.h"
+#include "patches/picture.h"
+#include "patches/cheats.h"
+#include "patches/song_store.h"
+#include "patches/song_cursor.h"
+#include "patches/options_volume.h"
+#include "patches/menu_geometry.h"
+#include "patches/cinema_timing.h"
+
+/* Crowd test controls (src/hooks/crowd_control.c, RECOMP_TEST_CROWD; off unless set). */
+void defjam_crowd_match_start(void);
+void defjam_crowd_update(void);
+void defjam_crowd_seed(uint32_t generator, uint32_t stack);
+void defjam_crowd_step(void);
 
 /* Read-only probes use the lifter's universal entry hooks. They do not alter
  * guest registers, stack, memory or the generated body. Off in normal play. */
@@ -44,42 +64,270 @@ void sub_001A50B0_enter(void)
 {
     if (defjam_test_observations_enabled())
         defjam_test_health_begin(MEM32(g_esp + 4), MEM32(g_esp));
+    cheats_health_change();     /* [cheats] infinite_health, no_regen (src/patches/cheats.c) */
 }
 void sub_001A6870_enter(void)
 {
     if (defjam_test_observations_enabled())
         defjam_test_health_notify(MEM32(g_esp + 4), MEM32(g_esp + 8));
 }
-/* Match telemetry (src/hooks/test_telemetry.c): the fight's simulation step,
- * match set-up, the result recorder and the random number generator's seeding.
- * Read-only, except that RECOMP_TEST_RNG_SEED replaces the seed argument. */
-void sub_00087700_enter(void)
+/* Widescreen: a fight HUD is up (src/patches/widescreen.c). The four fighter
+ * slots the fight camera reads (0x340D70, stride 0xC8; a slot counts when set
+ * and bit 3 of +0xC0 is clear): with 3 or 4 fighters the HUD has bottom rows. */
+static int s_ws_hud_live;      /* the simulation step ran since the match last left a fighting state */
+static void ws_hud_heartbeat(void)
 {
     extern void nv2a_ws_hud_heartbeat(int bottom_rows);
     uint32_t i, fighters = 0;
-    defjam_test_step();
-    /* Widescreen: a fight HUD is up (src/patches/widescreen.c). The four fighter
-     * slots the fight camera reads (0x340D70, stride 0xC8; a slot counts when set
-     * and bit 3 of +0xC0 is clear): with 3 or 4 fighters the HUD has bottom rows. */
     for (i = 0; i < 4; i++)
         if (MEM32(0x340D70 + i * 0xC8) != 0 && (MEM8(0x340D70 + i * 0xC8 + 0xC0) & 8) == 0)
             fighters++;
     nv2a_ws_hud_heartbeat(fighters >= 3);
 }
-void sub_001A4D90_enter(void) { defjam_test_match_start(); }
+/* Match telemetry (src/hooks/test_telemetry.c): the fight's simulation step,
+ * match set-up, the result recorder and the random number generator's seeding.
+ * Read-only, except that RECOMP_TEST_RNG_SEED replaces the seed argument. */
+void sub_00087700_enter(void)
+{
+    defjam_crowd_step();
+    defjam_test_step();
+    s_ws_hud_live = 1;
+    ws_hud_heartbeat();
+    cheats_fight_step();        /* [cheats] fight cheats (src/patches/cheats.c) */
+}
+/* The match's update (thiscall; the match at 0x349760, its state at +0x2D820).
+ * Only states 5 and 8 run the simulation step above; any other state (intro,
+ * special-move camera, match end) ends the live HUD. */
+void sub_0008BE60_enter(void)
+{
+    uint32_t state = MEM32(g_ecx + 0x2D820);
+    if (state != 5 && state != 8)
+        s_ws_hud_live = 0;
+}
+/* A fight mode's per-frame tick: 0x79B60 in Battle (measured), 0x7A8F0 the other
+ * mode built the same way (same match update and HUD calls; no route reaches it).
+ * While the pause menu is open it skips the match update, so the step stops, but
+ * it keeps running and the HUD stays on screen. Keep the widescreen HUD anchored
+ * through a pause that began in a live fight (issue #95); otherwise no change. */
+void sub_00079B60_enter(void) { if (s_ws_hud_live) ws_hud_heartbeat(); }
+void sub_0007A8F0_enter(void) { if (s_ws_hud_live) ws_hud_heartbeat(); }
+void sub_001A4D90_enter(void) { defjam_test_match_start(); defjam_crowd_match_start(); cheats_match_start(); song_cursor_match_start(); }
+/* Widescreen song notification (src/patches/widescreen.c, issue #118): the APT
+ * movie loader (archive, name, &apt, &const), and the next step of the load,
+ * which its only caller runs straight after it with the .apt data as its second
+ * stack argument. */
+void ws_apt_load_begin(uint32_t name);
+void ws_apt_load_done(uint32_t apt);
+void sub_001810B0_enter(void) { ws_apt_load_begin(MEM32(g_esp + 8)); }
+void sub_00056F50_enter(void) { ws_apt_load_done(MEM32(g_esp + 8)); }
+/* DynamicLoader's ELF parser: the input descriptor's +0x10 is the raw header,
+ * still before section fixup, relocation and vertex-buffer upload. */
+void sub_00109F80_enter(void) { menu_geometry_register(MEM32(g_ecx + 0x10)); }
+
+/* ---- Story shops: no LOADING frame on an item change (issue #119) ------
+ *
+ * Changing an item in a shop, the Sketch Artist or the wardrobe ends with
+ * CreatePlayer.ForceUpdate, whose callback (guest 0x0004A1A0) reconciles the
+ * created player's parts and loads what changed. The part loaders
+ * (0x000992E0, 0x0009A050, 0x0009AB90) announce a blocking load with event
+ * 0xF0000038, and the observer registered for it (0x0005AF80) clears the frame,
+ * draws the LOADING caption at the lower right, presents it and returns. On
+ * the console the load came off the disc and the card was the feedback for
+ * it; here it takes a few dozen milliseconds, so every item change flashes one
+ * black LOADING frame over the 4:3 picture before the preview comes back.
+ *
+ * Within a ForceUpdate -- from its callback's entry until the game presents
+ * its next ordinary frame -- the LOADING frame is skipped, so the preview
+ * stays on screen until the new item is ready. The load, the event and its
+ * other observers are untouched, and every other load keeps its card.
+ * RECOMP_SHOP_LOADING_CARD=1 restores the card. */
+static uint32_t s_presents;                     /* frames the game has presented */
+static uint32_t s_refresh_at = 0xFFFFFFFFu;     /* s_presents when a ForceUpdate began */
+void sub_00018DF0_enter(void) { s_presents++; }
+void sub_0004A1A0_enter(void) { s_refresh_at = s_presents; }
+extern void sub_0005AF80_gen(void);
+void sub_0005AF80(void)
+{
+    static int keep = -1;
+    if (keep < 0) {
+        const char *e = getenv("RECOMP_SHOP_LOADING_CARD");
+        keep = e && *e == '1';
+    }
+    if (!keep && s_refresh_at == s_presents) {
+        static unsigned skipped;
+        if (++skipped <= 4 || (skipped & (skipped - 1)) == 0)
+            fprintf(stderr, "[SHOP] item refresh: LOADING frame skipped (%u so far)\n", skipped);
+        g_esp += 4;     /* cdecl observer: consume the return address; the dispatcher pops its two args */
+        return;
+    }
+    sub_0005AF80_gen();
+}
 void sub_001BC690_enter(void) { defjam_test_rng(g_esp); }
 void sub_001AD220_enter(void) { defjam_test_ai_seed(g_esp); }
 /* The seeding routine every generator of this kind goes through (thiscall). */
-void sub_000AA0D0_enter(void) { defjam_test_generator_seed(g_ecx, g_esp); }
+void sub_000AA0D0_enter(void) { defjam_test_generator_seed(g_ecx, g_esp); defjam_crowd_seed(g_ecx, g_esp); }
+void sub_000C8820_enter(void) { defjam_test_logic_seed(g_ecx, g_esp); }
 /* Every draw (RECOMP_TEST_DRAWS): the C runtime's rand, the match generator, and the two
  * wrappers the object-form generators are drawn through; then the background crowd's update. */
 void sub_00200820_enter(void) { defjam_test_draw(1, MEM32(g_esp)); }
 void sub_001BC6E0_enter(void) { defjam_test_draw(2, MEM32(g_esp)); }
 void sub_000AA300_enter(void) { defjam_test_draw(g_ecx, MEM32(g_esp)); }
 void sub_000AA340_enter(void) { defjam_test_draw(g_ecx, MEM32(g_esp)); }
-void sub_000DB870_enter(void) { defjam_test_crowd_update(); }
+void sub_000DB870_enter(void) { defjam_test_crowd_update(); defjam_crowd_update(); }
+/* Story scenes (src/hooks/scene_launcher.c): the scene loader names every scene it loads, and
+ * the mode system's update plays one on request (RECOMP_SCENE, the overlay) through the game's
+ * own developer cinema mode. */
+void sub_00073FD0_enter(void) { scene_launcher_loader_enter(); }
+void sub_0002DFF0_enter(void) { scene_launcher_mode_enter(); }
+/* The developer run module, rebuilt from the host (src/hooks/dev_module.c): the manager's tick
+ * queues it on request; its methods are traced. RECOMP_DEV_MODULE; off unless set. */
+void sub_00077040_enter(void) { dev_module_manager_enter(); cheats_game_tick(); song_cursor_game_tick(); }  /* + Story cheats, src/patches/cheats.c; song shortcuts, src/patches/song_cursor.c */
+void sub_00077C40_enter(void) { dev_module_trace(1); }
+void sub_00077A40_enter(void) { dev_module_trace(3); }
+void sub_00077B20_enter(void) { dev_module_trace(4); }
+
+/* v0.16 direct callers reach this wrapper too; retain the generated renderer.
+ * No guest registers or return/stack words are changed by the wrapper itself. */
+extern void sub_000766B0_gen(void);
+void sub_000766B0(void) { defjam_cinema_render(sub_000766B0_gen); }
+void sub_00077DD0_enter(void) { dev_module_trace(7); }
 /* The per-fighter pad reader: RECOMP_TEST_INPUT replaces what it is about to read. */
 void sub_001BAA00_enter(void) { defjam_test_input(MEM32(g_esp + 4)); }
+/* Observe both sides of the calibrated fighter pad-consumption routine.
+ * v0.16's manual dispatch sends direct calls through this wrapper too. */
+extern void sub_001BAA00_gen(void);
+void sub_001BAA00(void)
+{
+    uint32_t actor = MEM32(g_esp + 4);
+    sub_001BAA00_gen();
+    defjam_input_latency_actor(actor, 1);
+}
+extern void sub_0027E075_gen(void);
+void sub_0027E075(void)
+{
+    if (input_latency_on() || input_consumption_on()) {
+        uint32_t handle = MEM32(g_esp + 4), state = MEM32(g_esp + 8);
+        input_latency_xdk_begin(handle);
+        sub_0027E075_gen();
+        input_consumption_xdk_end(handle, state, g_eax);
+        input_late_capture(handle, state, g_eax);
+    } else sub_0027E075_gen();
+}
+/* Optional fresh report at the controller manager's existing update, before
+ * DD930/DCE00 advance history. Lifecycle functions serialize with this read. */
+extern void sub_000DC970_gen(void);
+void sub_000DC970(void)
+{
+    uint32_t device=g_ecx, report=MEM32(g_esp+4);
+    sub_000DC970_gen();
+    if ((g_eax&0xFFu) && input_late_on()) input_late_refresh(device,report);
+}
+extern void sub_001EB980_gen(void);
+void sub_001EB980(void)
+{
+    uint32_t raw=input_late_raw();
+    if (raw) { g_eax=raw;g_esp+=4; } else sub_001EB980_gen();
+}
+/* Songs (src/patches/song_store.c). The song store is built with buffers that hold every song
+ * (this = the store); a profile load fills it from the save and the PC-side file (this = the
+ * profile manager); the playlist builders hand back at most what the playlist holds; the
+ * built playlist can be traced. */
+extern void sub_00013340_gen(void);
+void sub_00013340(void)
+{
+    song_store_before_build(g_ecx);
+    sub_00013340_gen();
+    song_store_after_build();
+}
+extern void sub_00014540_gen(void);
+void sub_00014540(void)
+{
+    uint32_t manager=g_ecx;
+    song_store_before_load(manager);
+    sub_00014540_gen();
+    song_store_after_load(manager);
+    options_volume_after_load(manager);    /* src/patches/options_volume.c: saved volumes to the mixer */
+}
+extern void sub_00020C40_gen(void);
+void sub_00020C40(void) { song_store_build_playlist(sub_00020C40_gen, 0); }
+/* Custom songs in order (src/patches/song_cursor.c): a music map context is set up
+ * (sub_00131080), and a track plays the node it is on (sub_001350E0, cdecl (track), once per
+ * segment and after every jump). */
+void sub_00131080_enter(void) { song_cursor_map_load(); }
+void sub_001350E0_enter(void) { song_cursor_play_node(MEM32(g_esp + 4)); }
+extern void sub_00020D70_gen(void);
+/* With songs added, the shuffled list is the ordered one shuffled on the host: the game's own
+ * shuffle keeps 36 songs in a stack array. */
+void sub_00020D70(void) { song_store_build_playlist(song_store_active() ? sub_00020C40_gen : sub_00020D70_gen, 1); }
+extern void sub_0004FD80_gen(void);
+void sub_0004FD80(void) { song_jukebox_build(sub_0004FD80_gen); }
+extern void sub_00050E00_gen(void);
+void sub_00050E00(void) { song_jukebox_enable(sub_00050E00_gen); }
+extern void sub_0004EEC0_gen(void);
+void sub_0004EEC0(void) { song_jukebox_play(sub_0004EEC0_gen); }
+/* The music engine's song names: 36 fixed slots in the game, room for every song here
+ * (src/patches/song_store.c, issue #230). */
+void sub_00033590(void) { song_info_add(); }
+void sub_00033630(void) { song_info_find(); }
+extern void sub_0003BE50_gen(void);
+void sub_0003BE50(void) { song_info_before_random(); sub_0003BE50_gen(); }
+extern void sub_0003CFF0_gen(void);
+void sub_0003CFF0(void)
+{
+    song_store_set_playlist(sub_0003CFF0_gen);
+    song_store_playlist_built();
+}
+extern void sub_000D7BF0_gen(void);
+void sub_000D7BF0(void)
+{
+    uint32_t port=MEM32(g_esp+8);
+    sub_000D7BF0_gen();
+    input_late_validate(port);
+}
+extern void sub_001EBBE0_gen(void);
+void sub_001EBBE0(void)
+{
+    input_late_lock();sub_001EBBE0_gen();input_late_unlock();
+}
+extern void sub_001EBE10_gen(void);
+void sub_001EBE10(void)
+{
+    input_late_lock();sub_001EBE10_gen();input_late_unlock();
+}
+extern void sub_001EBEA0_gen(void);
+void sub_001EBEA0(void)
+{
+    input_late_lock();sub_001EBEA0_gen();input_late_unlock();
+}
+/* Equivalent human input producers for the three game-mode update paths.
+ * sub_001AD380 is CPU-only. Include writer VA in each cache observation. */
+extern void sub_0002D9E0_gen(void);
+void sub_0002D9E0(void)
+{
+    if (input_latency_on()) {
+        input_latency_pad_cache(0x003B8F48u, 0, 0x0002D9E0u);
+        sub_0002D9E0_gen();
+        input_latency_pad_cache(0x003B8F48u, 1, 0x0002D9E0u);
+    } else sub_0002D9E0_gen();
+}
+extern void sub_00079280_gen(void);
+void sub_00079280(void)
+{
+    if (input_latency_on()) {
+        input_latency_pad_cache(0x003B8F48u, 0, 0x00079280u);
+        sub_00079280_gen();
+        input_latency_pad_cache(0x003B8F48u, 1, 0x00079280u);
+    } else sub_00079280_gen();
+}
+extern void sub_00079FA0_gen(void);
+void sub_00079FA0(void)
+{
+    if (input_latency_on()) {
+        input_latency_pad_cache(0x003B8F48u, 0, 0x00079FA0u);
+        sub_00079FA0_gen();
+        input_latency_pad_cache(0x003B8F48u, 1, 0x00079FA0u);
+    } else sub_00079FA0_gen();
+}
 void sub_001A6A80_enter(void)
 {
     if (defjam_test_observations_enabled())
@@ -121,8 +369,9 @@ void recomp_unimpl(const char *text, uint32_t va)
      * omissions; repeated IRQ/cache instructions must not exhaust that budget. */
     int known = !strcmp(text, "cli") || !strcmp(text, "sti") || !strcmp(text, "wbinvd");
     /* Exact PUSHFD/POPFD sites from the preserved baseline's lift summary and
-     * generated TODOs. Other sites remain failures. Implementing their flags
-     * and interrupt effects is a separate runtime project, not this migration. */
+     * generated TODOs. Other sites remain failures. Since toolkit v0.16 the
+     * lifter translates both through a g_eflags image (#186), so these no
+     * longer reach here; kept for code lifted by an older toolkit. */
     if (!strcmp(text, "pushfd"))
         known = va == 0x00088500u || va == 0x0009F2C0u || va == 0x00130B46u
              || va == 0x002470B8u || va == 0x002470C4u;
@@ -279,6 +528,125 @@ void sub_0025FB7C(void)
  *
  * sub_0025F394 posts command 3 to the same block and waits the same way; it
  * has not been seen to run, so it is left alone. */
+/* ---- Fight judder: the frame clock's phase (issue #140) ------------------
+ *
+ * The game does not step once per drawn frame. Its frame clock (the timer
+ * chain below, 60 Hz on the host's counter) queues one record per tick, and
+ * the main loop's step gate (sub_000D75E0) runs one simulation step per queued
+ * record before each frame it draws, 0 to 4 of them. The frames themselves
+ * follow the guest vblank, which in the paced mode follows the display. Two
+ * clocks of almost the same rate: their phase drifts slowly, and while a tick
+ * falls within a millisecond of the gate's first check, host jitter puts it
+ * before one check and after the next. A frame then runs no step and the next
+ * two, at an even present rate: the fight's motion judders, for as long as a
+ * minute until the phase drifts on (the owner's Club 357 fight: 43% of frames,
+ * 73% at worst; some scripted fights 0%, others 40%; v0.12.1 alike).
+ *
+ * So each tick is steered, by at most 1% of a period, towards the middle
+ * between two first checks of the gate. The title's own schedule is absolute
+ * (each deadline is the last one plus a period, its lateness measured against
+ * the delay it stored at +0x1A90), so the same shift goes into that stored
+ * delay and the title keeps it instead of correcting it away. Only while the
+ * loop runs at the clock's rate (its period within 2%), so a slow host still
+ * catches up as before. RECOMP_FRAME_CLOCK_LOCK=0 (or RECOMP_TEST_FRAME_CLOCK_LOCK=0)
+ * turns the steering off; RECOMP_FRAME_CLOCK_TRACE=1 (or RECOMP_TEST_...) logs the
+ * steps per frame every 10 s either way. */
+#define FRAME_CLOCK_OBJ    0x003A0178u   /* the clock: period +0x1A80, last arm +0x1A88, stored delay +0x1A90 */
+#define FRAME_CLOCK_CB     0x000D7EA0u   /* its callback */
+static volatile LONG64 s_fc_check;       /* TSC of the gate's latest first check */
+static volatile LONG64 s_fc_frame;       /* smoothed time between two first checks, TSC ticks */
+static unsigned s_fc_calls;              /* gate calls since the latest first check */
+static unsigned s_fc_hist[4], s_fc_pairs, s_fc_frames, s_fc_prev_steps = 1;
+static LONG64 s_fc_shift;                /* steering applied since the last report, TSC ticks */
+static int fc_env(const char *name, const char *test_name)
+{
+    const char *e = getenv(name);
+    if (!e || !*e) e = getenv(test_name);
+    return !e || !*e ? -1 : *e != '0';
+}
+static int fc_lock_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = fc_env("RECOMP_FRAME_CLOCK_LOCK", "RECOMP_TEST_FRAME_CLOCK_LOCK") != 0;
+    return on;
+}
+static int fc_trace_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = fc_env("RECOMP_FRAME_CLOCK_TRACE", "RECOMP_TEST_FRAME_CLOCK_TRACE") == 1;
+    return on;
+}
+extern uint64_t xbox_ReadTimeStampCounter(void);
+/* The step gate, thiscall on the frame queue: +0x1A5C counts this frame's
+ * steps and is 0 on the frame's first check (the gate zeroes it when it says
+ * stop), so a 0 there is the moment this frame starts taking steps. */
+void sub_000D75E0_enter(void)
+{
+    LONG64 now, prev, d, f;
+    unsigned steps;
+    s_fc_calls++;
+    if (MEM32(g_ecx + 0x1A5C) != 0)
+        return;
+    now = (LONG64)xbox_ReadTimeStampCounter();
+    prev = s_fc_check;
+    if (prev && now > prev) {
+        d = now - prev;
+        f = s_fc_frame;
+        if (d < 12222222 * 4)                        /* a frame, not a pause */
+            s_fc_frame = f ? f + (d - f) / 16 : d;
+    }
+    s_fc_check = now;
+    /* The frame that just ended made s_fc_calls - 1 calls (this one is the new
+     * frame's), the last of which said stop: one step fewer than its calls. */
+    steps = s_fc_calls >= 2 ? s_fc_calls - 2 : 0;
+    s_fc_calls = 1;
+    if (!fc_trace_on() || !prev)
+        return;
+    s_fc_hist[steps < 3 ? steps : 3]++;
+    if ((steps == 0 && s_fc_prev_steps == 2) || (steps == 2 && s_fc_prev_steps == 0))
+        s_fc_pairs++;
+    s_fc_prev_steps = steps;
+    if (++s_fc_frames >= 600) {
+        fprintf(stderr, "[FRAMECLOCK] %u frames: steps 0:%u 1:%u 2:%u 3+:%u, 0/2 alternations %u;"
+                        " frame %.3f ms, lock %s, steering %+.3f ms\n",
+                s_fc_frames, s_fc_hist[0], s_fc_hist[1], s_fc_hist[2], s_fc_hist[3], s_fc_pairs,
+                (double)s_fc_frame / 733333.333, fc_lock_on() ? "on" : "off",
+                (double)s_fc_shift / 733333.333);
+        memset(s_fc_hist, 0, sizeof s_fc_hist);
+        s_fc_pairs = s_fc_frames = 0;
+        s_fc_shift = 0;
+    }
+}
+/* The shift for a frame-clock tick due at `target`, or 0. Also writes it into
+ * the title's stored delay so its next lateness correction keeps it. */
+static LONG64 fc_steer(uint64_t target, uint64_t now)
+{
+    uint32_t clock = MEM32(FRAME_CLOCK_OBJ);
+    LONG64 check = s_fc_check, frame = s_fc_frame, period, phase, err, shift;
+    uint64_t stored;
+    if (!clock || !check || frame <= 0)
+        return 0;
+    period = (LONG64)(((uint64_t)MEM32(clock + 0x1A84) << 32) | MEM32(clock + 0x1A80));
+    if (period <= 0 || frame < period - period / 50 || frame > period + period / 50)
+        return 0;                                    /* not running at the clock's rate */
+    if ((LONG64)now - check > 3 * frame)
+        return 0;                                    /* the loop is not taking steps now */
+    phase = ((LONG64)target - check) % frame;
+    if (phase < 0) phase += frame;
+    err = phase - frame / 2;                         /* -frame/2 .. +frame/2: 0 is mid-frame */
+    shift = -err / 8;
+    if (shift > period / 100) shift = period / 100;
+    if (shift < -period / 100) shift = -period / 100;
+    if (!shift)
+        return 0;
+    stored = ((uint64_t)MEM32(clock + 0x1A94) << 32) | MEM32(clock + 0x1A90);
+    stored += (uint64_t)shift;
+    MEM32(clock + 0x1A90) = (uint32_t)stored;
+    MEM32(clock + 0x1A94) = (uint32_t)(stored >> 32);
+    s_fc_shift += shift;
+    return shift;
+}
+
 /* Direct3D's timer callback (0x00216410, D3DDevice_SetTimerCallback's body:
  * time in TSC ticks, callback, context), with one change: a time already
  * past is armed at once instead of refused.
@@ -310,6 +678,8 @@ void sub_00216410(void)
     if (cb) {
         uint64_t target = ((uint64_t)t_hi << 32) | t_lo;
         uint64_t now = xbox_ReadTimeStampCounter();
+        if (cb == FRAME_CLOCK_CB && fc_lock_on())
+            target += (uint64_t)fc_steer(target, now);   /* issue #140, above */
         if (target <= now + 0x28) {
             static unsigned late;
             if (late++ < 8 || (late & (late - 1)) == 0)
@@ -405,12 +775,12 @@ done:
  * returned. Neither ever printed anything, and the reason is worth keeping.
  *
  * Declaring `extern void sub_X_gen(void);` does emit the real body under that
- * name -- and it also rewrites every direct call site to call `sub_X_gen`
- * instead. So a direct caller goes straight to the original body and the
- * wrapper is never on the path. It only intercepts calls that arrive through
- * recomp_lookup_manual(), which sees indirect calls only. The sleep trace
- * below works for exactly that reason: its target is reached through a
- * function pointer.
+ * name -- and with toolkit v0.13 it also rewrote every direct call site to call
+ * `sub_X_gen` instead, so a direct caller went straight to the original body
+ * and the wrapper was never on the path. Since v0.16 (upstream #175) a direct
+ * call to a wrapped function goes through the manual lookup and does reach the
+ * wrapper; these two were not retried. The sleep trace below is reached
+ * through a function pointer either way.
  *
  * To trace a function with direct callers, either replace it outright (define
  * it here without the `_gen` declaration and implement the behaviour), or put
@@ -485,6 +855,32 @@ static void trace_sleep_caller(void)
  * offered to the script anchors, so a pad script can wait for a screen:
  * "@getscreeninfo(intmain/mainmenu" (matched without case).
  */
+extern void defjam_skip_intro_enter(void);
+void sub_0006BC90_enter(void) { defjam_skip_intro_enter(); }
+
+/* A cutscene's subtitle set-up: show them in every Story cutscene when asked
+ * (src/patches/subtitles.c). ecx is the subtitle state; read it before the body. */
+extern void sub_000DA8A0_gen(void);
+extern void defjam_subtitles_after_nis_setup(uint32_t state);
+void sub_000DA8A0(void)
+{
+    uint32_t state = g_ecx;
+    sub_000DA8A0_gen();
+    defjam_subtitles_after_nis_setup(state);
+}
+
+/* The string-table load: the boot call (returning to 0x00012134) always asks for
+ * language 1, US English; [language] game can make it 3, French
+ * (src/patches/game_language.c). The argument is on the stack above the return address. */
+extern void sub_00044FC0_gen(void);
+extern uint32_t defjam_game_language_at_boot(uint32_t asked);
+void sub_00044FC0(void)
+{
+    if (MEM32(g_esp) == 0x00012134u)
+        MEM32(g_esp + 4) = defjam_game_language_at_boot(MEM32(g_esp + 4));
+    sub_00044FC0_gen();
+}
+
 extern void sub_00068BA0(void);
 extern void xbox_NoteAnchorEvent(const char *text);
 extern void defjam_unlock_all_on_funccall(const char *text);
@@ -505,9 +901,16 @@ static void funccall_hook(void)
     text[i] = 0;
     if (printed++ < 4000)
         fprintf(stderr, "[FUNCCALL] %s\n", text);
+    /* The play-test recorder keeps every one, with its time (the log stops at 4000). */
+    recorder_event_text("fe", "text", text);
     xbox_NoteAnchorEvent(text);
     defjam_unlock_all_on_funccall(text);   /* RECOMP_UNLOCK_ALL, src/patches/dev_unlock.c */
+    cheats_on_funccall(text);              /* Story tracking and Story cheats, src/patches/cheats.c */
+    song_store_on_funccall(text);          /* songs: the save's copy before MemCard.*, src/patches/song_store.c */
     sub_00068BA0();
+    /* RECOMP_FE_INJECT: commands of a test's own, after a chosen call (src/hooks/fe_inject.c). */
+    fe_inject_after_call(text);
+    dev_module_after_call(text);
 }
 
 /* ---- Trace chosen functions, by guest address --------------------------
@@ -636,6 +1039,20 @@ static void trace_voice_render(void)
 
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
 {
+    if (xbox_va == 0x000766B0u)
+        return sub_000766B0;
+    if (xbox_va == 0x001BAA00u && input_latency_on())
+        return sub_001BAA00;
+    if (xbox_va == 0x0027E075u && (input_latency_on() || input_consumption_on())) return sub_0027E075;
+    if (xbox_va == 0x000DC970u && input_late_on()) return sub_000DC970;
+    if (xbox_va == 0x001EB980u && input_late_on()) return sub_001EB980;
+    if (xbox_va == 0x000D7BF0u && input_late_on()) return sub_000D7BF0;
+    if (xbox_va == 0x001EBBE0u && input_late_on()) return sub_001EBBE0;
+    if (xbox_va == 0x001EBE10u && input_late_on()) return sub_001EBE10;
+    if (xbox_va == 0x001EBEA0u && input_late_on()) return sub_001EBEA0;
+    if (xbox_va == 0x0002D9E0u && input_latency_on()) return sub_0002D9E0;
+    if (xbox_va == 0x00079280u && input_latency_on()) return sub_00079280;
+    if (xbox_va == 0x00079FA0u && input_latency_on()) return sub_00079FA0;
     if (xbox_va == 0x0012C310u && getenv("RECOMP_TRACE_VOICE"))
         return trace_voice_render;
     /* This hook sees indirect calls only, so it suits a trace wrapper or a
@@ -887,20 +1304,17 @@ void sub_0021EB90_enter(void)
  * 64 -> 52, 128 -> 125, 192 -> 198, 224 -> 233) that deepens the shadows,
  * which is why everything looked lighter than the console. The runtime's
  * Direct3D layer already applies a ramp at presentation (d3d8_gamma.c); this
- * hands it the title's. g_recomp_gamma is the same ramp for captures, which
- * are read before presentation. RECOMP_GAMMA=0 leaves the picture as drawn.
+ * hands it the title's, after the player's brightness (src/patches/picture.c, which
+ * also keeps g_recomp_gamma, the same ramp for captures, which are read before
+ * presentation). RECOMP_GAMMA=0 leaves the title's ramp out.
  */
-uint8_t g_recomp_gamma[3][256];
-int g_recomp_gamma_on;
-
 void sub_002203C6_enter(void)
 {
-    struct { uint16_t c[3][256]; } ramp;
-    extern void d3d8_gamma_set(const void *ramp);
+    uint8_t ramp[3 * 256];
     static int on = -1;
     static unsigned sets;
     uint32_t src = MEM32(g_esp + 4);
-    int c, i;
+    int i;
 
     if (on < 0) {
         const char *e = getenv("RECOMP_GAMMA");
@@ -908,18 +1322,38 @@ void sub_002203C6_enter(void)
     }
     if (!on || src < 0x10000u)
         return;
-    for (c = 0; c < 3; c++)
-        for (i = 0; i < 256; i++) {
-            uint8_t v = MEM8(src + c * 256 + i);
-            g_recomp_gamma[c][i] = v;
-            ramp.c[c][i] = (uint16_t)(v * 257);
-        }
-    g_recomp_gamma_on = 1;
-    d3d8_gamma_set(&ramp);
+    for (i = 0; i < 3 * 256; i++)
+        ramp[i] = MEM8(src + i);
+    picture_title_ramp(ramp);
     if (sets++ < 4)
         fprintf(stderr, "[GAMMA] ramp set: 32 -> %u, 64 -> %u, 128 -> %u, 192 -> %u, 224 -> %u\n",
-                g_recomp_gamma[0][32], g_recomp_gamma[0][64], g_recomp_gamma[0][128],
-                g_recomp_gamma[0][192], g_recomp_gamma[0][224]);
+                ramp[32], ramp[64], ramp[128], ramp[192], ramp[224]);
+}
+
+/*
+ * The venue vignette ([display] vignette, vignette_strength; src/patches/picture.c).
+ * sub_000D9AF0 is the platform tint's per-frame draw, whose last argument turns the
+ * "Vignette Quad" on; sub_00028460 sets a quad's colour, where a weaker vignette
+ * gets its alpha and blend.
+ */
+void sub_000D9AF0_enter(void) { picture_tint_draw_enter(); }
+void sub_00028460_enter(void) { picture_quad_color_enter(); }
+
+/*
+ * The rest of the venue post effects ([display] color_tint, scratches). sub_000D8C40 draws the
+ * current variance each frame (its entry logs it with RECOMP_POSTFX_TRACE=1); sub_000D8AD0 is
+ * the film scratch overlay it calls when the variance's ScratchesEnable is set (thiscall, no
+ * arguments, plain ret), skipped when scratches are off.
+ */
+void sub_000D8C40_enter(void) { picture_postfx_enter(); }
+extern void sub_000D8AD0_gen(void);
+void sub_000D8AD0(void)
+{
+    if (!picture_scratches_on()) {
+        g_esp += 4;     /* thiscall, no arguments: the return address */
+        return;
+    }
+    sub_000D8AD0_gen();
 }
 
 /*
@@ -950,3 +1384,4 @@ extern void ws_trace_pos(void), ws_trace_vtx_arr(void), ws_trace_vtx(void);
 void sub_00028F90_enter(void) { ws_trace_pos(); }
 void sub_0002E390_enter(void) { ws_trace_vtx_arr(); }
 void sub_0002E470_enter(void) { ws_trace_vtx(); }
+

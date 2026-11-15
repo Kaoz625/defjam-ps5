@@ -21,6 +21,9 @@
  * The shaders are the ones the Direct3D 11 backend uses: the same HLSL text,
  * from the same generators, compiled to SPIR-V at run time by shaderc. So a
  * change to how a combiner or a vertex program is translated is made once.
+ * With a cache folder set (d3d8_vk_set_cache_dir), the SPIR-V and the driver's
+ * pipeline cache are kept there between runs (d3d8_vk_cache.h), so a shader
+ * met in an earlier run is not compiled again.
  *
  * The picture is drawn into an off-screen target `render scale` times the
  * title's 640x480 and copied to the window at present, scaled and letterboxed.
@@ -34,6 +37,8 @@
 #include "d3d8_combiners.h"
 #include "d3d8_vk.h"
 #include "d3d8_present.h"  /* d3d8_canvas_width */
+#include "d3d8_readback.h"
+#include "d3d8_vk_cache.h"
 #include "win32_compat.h"   /* GetTickCount64 */
 
 #include <vulkan/vulkan.h>
@@ -78,6 +83,19 @@ void d3d8_vk_set_overlay(const D3D8VkOverlay *overlay)
         s_overlay = *overlay;
 }
 
+/* The shader cache's folder (d3d8_vk.h). RECOMP_SHADER_CACHE overrides it: a
+ * folder, or 0 / off for none. */
+static char s_cache_dir[1024];
+void d3d8_vk_set_cache_dir(const char *dir)
+{
+    snprintf(s_cache_dir, sizeof s_cache_dir, "%s", dir ? dir : "");
+}
+
+/* Bump when the SPIR-V for the same HLSL text would change: the shaderc
+ * options in resources_make, the binding bases, the entry point. The text
+ * itself (the translators' output) is in the key already. */
+#define SHADER_CACHE_VERSION 1u
+
 static unsigned s_render_scale = 1;
 static int      s_scaling, s_keep_aspect = 1, s_linear = 1, s_vsync;
 static unsigned s_aspect_num = 4, s_aspect_den = 3;
@@ -98,6 +116,21 @@ void d3d8_present_set_aspect(int keep, unsigned num, unsigned den)
 }
 void d3d8_present_set_vsync(int vsync)             { s_vsync = vsync; }
 void d3d8_present_set_linear_filter(int linear)    { s_linear = linear; }
+void d3d8_present_set_filter_mode(int mode)        { s_linear = mode < 0 ? 0 : mode > 2 ? 2 : mode; }
+
+/* [display] msaa: the samples asked for, read once when the target is made. */
+static unsigned s_msaa_want = 1;
+void d3d8_set_msaa(unsigned samples)               { s_msaa_want = samples; }
+
+/* [display] anisotropy: an index into the sampler cache, 0 (off) .. 4 (16x). */
+static volatile int s_aniso_level;
+void d3d8_set_texture_anisotropy(unsigned max)
+{
+    int level = 0;
+    while (level < 4 && (2u << level) <= max)
+        level++;
+    s_aniso_level = level;
+}
 /* The title's own 60 Hz timer paces the frames here; the display never does. */
 int  d3d8_present_display_paced(void)              { return 0; }
 /* The title's gamma ramp, applied to what the window shows (gamma_pass below).
@@ -133,9 +166,28 @@ typedef struct {
     VkDeviceMemory mem;
     uint8_t       *map;
     VkDeviceSize   size, at;
+    int            coherent;    /* 0: host-cached only; invalidate before the CPU reads */
 } Ring;
 
 typedef struct { VkImage img; VkDeviceMemory mem; VkImageView view; } Retired;
+
+/* The per-frame objects the CPU rewrites while the GPU may still be reading the
+ * previous frame. Two sets, used in turn: a frame is submitted without waiting
+ * for it, and the wait for its fence comes when its set is wanted again, two
+ * frames on. vk.cmd, vk.vtx and the others below are copies of the set in use. */
+#define FRAME_SLOTS 2
+typedef struct {
+    VkCommandPool    pool;
+    VkCommandBuffer  cmd, cmd_up;
+    VkFence          fence;
+    VkSemaphore      acquired;
+    VkDescriptorPool dpool;
+    Ring             vtx, idx, ubo, stage;
+    Retired          retired[1024];
+    int              retired_n;
+    int              pending;           /* submitted, fence not yet waited */
+    uint64_t         seq;               /* its submit's number */
+} FrameSlot;
 
 #define MAX_TEX_LEVELS 15
 
@@ -184,6 +236,10 @@ typedef struct { uint32_t hash, used; int points, failed; uint32_t shader; uint6
 typedef struct { int used; NV2ACombinerState st; uint32_t shader; } CombEntry;
 #define COMB_SLOTS 256
 #define MAX_SHADERS 1024
+/* Each HLSL text made into a module this run, by two hashes of it and its
+ * stage: the same text gets the same module. Twice MAX_SHADERS, never full. */
+typedef struct { uint64_t key, check; uint32_t id; } ShaderSeen;
+#define SEEN_SLOTS (2 * MAX_SHADERS)
 
 static struct {
     int ready;
@@ -213,6 +269,13 @@ static struct {
     VkImage        color, depth;
     VkDeviceMemory color_mem, depth_mem;
     VkImageView    color_view, depth_view;
+    /* MSAA ([display] msaa, d3d8_set_msaa): the title draws into color_ms and a
+     * depth buffer with as many samples, and each render pass resolves color_ms
+     * into color, which is what everything after the draws reads. */
+    VkSampleCountFlagBits samples;
+    VkImage        color_ms;
+    VkDeviceMemory color_ms_mem;
+    VkImageView    color_ms_view;
     VkRenderPass   pass;
     VkFramebuffer  fb;
 
@@ -241,15 +304,26 @@ static struct {
     VkDescriptorSetLayout dsl;
     VkPipelineLayout      pl;
     VkDescriptorPool      dpool;
-    VkSampler             samplers[4][4][2][2][3];
+    VkSampler             samplers[4][4][2][2][3][5];  /* ... x anisotropy 1, 2, 4, 8, 16 */
+    float                 max_anisotropy;              /* 0: the device has no anisotropic filtering */
     VkImage        dummy;
     VkDeviceMemory dummy_mem;
     VkImageView    dummy_view;
 
     shaderc_compiler_t        sc;
     shaderc_compile_options_t sc_opts;
+    VkPipelineCache pcache;
+    VkcDevice       pcache_dev;
+    uint32_t        pcache_new;     /* pipelines made since the cache was last written */
+    uint64_t        pcache_hash;    /* of the data last read or written: unchanged is not written */
+    ULONGLONG       pcache_last_new;
+    /* What shaders and pipelines cost: counts and microseconds. */
+    uint32_t spv_hits, spv_misses, spv_reused, pipes_made;
+    uint64_t spv_load_us, spv_compile_us, pipes_us;
+    uint32_t perf_printed;
     VkShaderModule shaders[MAX_SHADERS];
     uint32_t       shader_n;
+    ShaderSeen     seen[SEEN_SLOTS];
     uint32_t       vs_fixed, ps_tex, ps_notex;
 
     PipeEntry pipes[PIPE_SLOTS];
@@ -258,8 +332,9 @@ static struct {
     uint64_t  prog_tick;
     CombEntry combs[COMB_SLOTS];
 
-    Retired  retired[1024];
-    int      retired_n;
+    FrameSlot *slot;                /* FRAME_SLOTS of them; vk.cur is the one in use */
+    int        cur;
+    VkSemaphore rdone[8];           /* signalled by the submit that draws swap-chain image n */
 
     /* What the command buffer currently has bound. */
     VkPipeline      bound_pipe;
@@ -299,12 +374,29 @@ static uint32_t mem_type(uint32_t bits, VkMemoryPropertyFlags want)
     return 0;
 }
 
-static int ring_make(Ring *r, VkDeviceSize size, VkBufferUsageFlags usage)
+static uint32_t mem_type_any(uint32_t bits, VkMemoryPropertyFlags want, VkMemoryPropertyFlags avoid)
+{
+    uint32_t i;
+    for (i = 0; i < vk.memprops.memoryTypeCount; i++) {
+        VkMemoryPropertyFlags f = vk.memprops.memoryTypes[i].propertyFlags;
+        if ((bits & (1u << i)) && (f & want) == want && !(f & avoid))
+            return i;
+    }
+    return UINT32_MAX;
+}
+
+/* `readback`: the CPU reads this buffer, so prefer host-cached memory. Plain
+ * host-visible memory can be uncached (write-combined) -- the Steam Deck's APU
+ * is one -- where reading a picture back costs hundreds of milliseconds.
+ * Without a cached type the buffer is the plain one it always was. */
+static int ring_make_ex(Ring *r, VkDeviceSize size, VkBufferUsageFlags usage, int readback)
 {
     VkBufferCreateInfo bi = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
     VkMemoryRequirements mr;
     VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
     void *p = NULL;
+    uint32_t type = UINT32_MAX;
+    int coherent = 1;
 
     bi.size = size;
     bi.usage = usage;
@@ -312,8 +404,21 @@ static int ring_make(Ring *r, VkDeviceSize size, VkBufferUsageFlags usage)
         return 0;
     vkGetBufferMemoryRequirements(vk.dev, r->buf, &mr);
     ai.allocationSize = mr.size;
-    ai.memoryTypeIndex = mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
-                                                     | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (readback) {
+        type = mem_type_any(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                            | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 0);
+        if (type == UINT32_MAX) {
+            type = mem_type_any(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                                | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 0);
+            coherent = 0;
+        }
+    }
+    if (type == UINT32_MAX) {
+        type = mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                                           | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        coherent = 1;
+    }
+    ai.memoryTypeIndex = type;
     if (vkAllocateMemory(vk.dev, &ai, NULL, &r->mem) != VK_SUCCESS
             || vkBindBufferMemory(vk.dev, r->buf, r->mem, 0) != VK_SUCCESS
             || vkMapMemory(vk.dev, r->mem, 0, size, 0, &p) != VK_SUCCESS)
@@ -321,12 +426,40 @@ static int ring_make(Ring *r, VkDeviceSize size, VkBufferUsageFlags usage)
     r->map = p;
     r->size = size;
     r->at = 0;
+    r->coherent = coherent;
     return 1;
 }
+
+static int ring_make(Ring *r, VkDeviceSize size, VkBufferUsageFlags usage)
+{
+    return ring_make_ex(r, size, usage, 0);
+}
+
+/* Make a finished GPU write visible to the CPU (a no-op on coherent memory). */
+static void ring_invalidate(const Ring *r)
+{
+    VkMappedMemoryRange range = { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE };
+    if (r->coherent)
+        return;
+    range.memory = r->mem;
+    range.size = VK_WHOLE_SIZE;
+    vkInvalidateMappedMemoryRanges(vk.dev, 1, &range);
+}
+
+static int image_make_samples(uint32_t w, uint32_t h, uint32_t levels, VkSampleCountFlagBits samples,
+                              VkFormat fmt, VkImageUsageFlags usage, VkImageAspectFlags aspect,
+                              VkImage *img, VkDeviceMemory *mem, VkImageView *view);
 
 static int image_make_levels(uint32_t w, uint32_t h, uint32_t levels, VkFormat fmt, VkImageUsageFlags usage,
                              VkImageAspectFlags aspect, VkImage *img, VkDeviceMemory *mem,
                              VkImageView *view)
+{
+    return image_make_samples(w, h, levels, VK_SAMPLE_COUNT_1_BIT, fmt, usage, aspect, img, mem, view);
+}
+
+static int image_make_samples(uint32_t w, uint32_t h, uint32_t levels, VkSampleCountFlagBits samples,
+                              VkFormat fmt, VkImageUsageFlags usage, VkImageAspectFlags aspect,
+                              VkImage *img, VkDeviceMemory *mem, VkImageView *view)
 {
     VkImageCreateInfo ii = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
     VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
@@ -337,7 +470,7 @@ static int image_make_levels(uint32_t w, uint32_t h, uint32_t levels, VkFormat f
     ii.format = fmt;
     ii.extent.width = w; ii.extent.height = h; ii.extent.depth = 1;
     ii.mipLevels = levels; ii.arrayLayers = 1;
-    ii.samples = VK_SAMPLE_COUNT_1_BIT;
+    ii.samples = samples;
     ii.tiling = VK_IMAGE_TILING_OPTIMAL;
     ii.usage = usage;
     if (vkCreateImage(vk.dev, &ii, NULL, img) != VK_SUCCESS)
@@ -392,8 +525,9 @@ static void retire(VkImage img, VkDeviceMemory mem, VkImageView view)
 {
     if (!img)
         return;
-    if (vk.retired_n < (int)(sizeof vk.retired / sizeof vk.retired[0])) {
-        Retired *r = &vk.retired[vk.retired_n++];
+    FrameSlot *sl = vk.slot ? &vk.slot[vk.cur] : NULL;
+    if (sl && sl->retired_n < (int)(sizeof sl->retired / sizeof sl->retired[0])) {
+        Retired *r = &sl->retired[sl->retired_n++];
         r->img = img; r->mem = mem; r->view = view;
     }
     /* Past that the image leaks rather than being destroyed while a command
@@ -402,17 +536,104 @@ static void retire(VkImage img, VkDeviceMemory mem, VkImageView view)
 
 /* ── Frames ────────────────────────────────────────────────────────────── */
 
+/* Submits made, and submits known to have finished (they finish in order). */
+static uint64_t g_submits_issued, g_submits_done;
+static uint64_t g_fence_wait_ticks, g_acquire_ticks, g_present_ticks;   /* time spent waiting for the GPU, for the 2 s line */
+
+/* The images a slot's frames retired, once its fence has passed. */
+static void slot_free_retired(FrameSlot *sl)
+{
+    int i;
+    for (i = 0; i < sl->retired_n; i++) {
+        vkDestroyImageView(vk.dev, sl->retired[i].view, NULL);
+        vkDestroyImage(vk.dev, sl->retired[i].img, NULL);
+        vkFreeMemory(vk.dev, sl->retired[i].mem, NULL);
+    }
+    sl->retired_n = 0;
+}
+
+/* Wait for a slot's frame to finish, if it has not. */
+static void slot_wait(FrameSlot *sl)
+{
+    if (sl->pending) {
+        LARGE_INTEGER a, b;
+        QueryPerformanceCounter(&a);
+        VKC(vkWaitForFences(vk.dev, 1, &sl->fence, VK_TRUE, UINT64_MAX));
+        QueryPerformanceCounter(&b);
+        g_fence_wait_ticks += (uint64_t)(b.QuadPart - a.QuadPart);
+        sl->pending = 0;
+        if (sl->seq > g_submits_done)
+            g_submits_done = sl->seq;
+    }
+    slot_free_retired(sl);
+}
+
+/* Every submitted frame finished. The slot that was submitted last goes first:
+ * the others finished before it. */
+static void frames_wait_all(void)
+{
+    int i;
+    for (i = 0; i < FRAME_SLOTS; i++)
+        slot_wait(&vk.slot[(vk.cur + FRAME_SLOTS - i) % FRAME_SLOTS]);
+}
+
+/* Slots whose fences have already passed, without waiting: the readback poll
+ * counts finished submits. */
+static void frames_reap(void)
+{
+    int i;
+    for (i = 0; i < FRAME_SLOTS; i++) {
+        FrameSlot *sl = &vk.slot[i];
+        if (sl->pending && vkGetFenceStatus(vk.dev, sl->fence) == VK_SUCCESS) {
+            sl->pending = 0;
+            if (sl->seq > g_submits_done)
+                g_submits_done = sl->seq;
+        }
+    }
+}
+
+/* Take the next slot's objects, waiting for the frame that last used them. */
+static void slot_switch(void)
+{
+    int next = (vk.cur + 1) % FRAME_SLOTS;
+    FrameSlot *sl = &vk.slot[next];
+
+    slot_wait(sl);
+    vk.cur = next;
+    vk.pool = sl->pool;
+    vk.cmd = sl->cmd;
+    vk.cmd_up = sl->cmd_up;
+    vk.fence = sl->fence;
+    vk.acquired = sl->acquired;
+    vk.dpool = sl->dpool;
+    vk.vtx = sl->vtx;
+    vk.idx = sl->idx;
+    vk.ubo = sl->ubo;
+    vk.stage = sl->stage;
+}
+
 static void frame_begin(void)
 {
     VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
 
     if (vk.frame_open)
         return;
+    slot_switch();
     VKC(vkResetCommandPool(vk.dev, vk.pool, 0));
     VKC(vkResetDescriptorPool(vk.dev, vk.dpool, 0));
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VKC(vkBeginCommandBuffer(vk.cmd, &bi));
     VKC(vkBeginCommandBuffer(vk.cmd_up, &bi));
+    {
+        /* The frame before may still be running: nothing in this one starts
+         * until it has finished, as when the CPU waited for it. What the CPU
+         * overlaps is recording, not the GPU's work. */
+        VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+        mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        vkCmdPipelineBarrier(vk.cmd_up, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             0, 1, &mb, 0, NULL, 0, NULL);
+    }
     vk.vtx.at = vk.idx.at = vk.ubo.at = vk.stage.at = 0;
     vk.frame_open = 1;
     vk.in_pass = 0;
@@ -455,15 +676,16 @@ static void pass_end(void)
     }
 }
 
-/* Hand the frame's commands to the GPU and wait for them. Uploads first:
- * they were recorded apart so they need not interrupt the render pass. */
-static uint64_t g_fence_wait_ticks, g_acquire_ticks, g_present_ticks;   /* time spent waiting for the GPU, for the 2 s line */
-static void frame_submit_wait(VkSemaphore wait)
+/* Hand the frame's commands to the GPU. Uploads first: they were recorded
+ * apart so they need not interrupt the render pass. `signal` is raised when
+ * they are done (the present waits on it). `sync`: wait for them and for every
+ * frame before; otherwise the wait comes when the slot is next wanted. */
+static void frame_submit_ex(VkSemaphore wait, VkSemaphore signal, int sync)
 {
     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
     VkCommandBuffer cbs[2];
     VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-    int i;
+    FrameSlot *sl = &vk.slot[vk.cur];
 
     if (!vk.frame_open)
         return;
@@ -479,23 +701,20 @@ static void frame_submit_wait(VkSemaphore wait)
         si.pWaitSemaphores = &wait;
         si.pWaitDstStageMask = &stage;
     }
+    if (signal) {
+        si.signalSemaphoreCount = 1;
+        si.pSignalSemaphores = &signal;
+    }
     VKC(vkResetFences(vk.dev, 1, &vk.fence));
     VKC(vkQueueSubmit(vk.queue, 1, &si, vk.fence));
-    {
-        LARGE_INTEGER a, b;
-        QueryPerformanceCounter(&a);
-        VKC(vkWaitForFences(vk.dev, 1, &vk.fence, VK_TRUE, UINT64_MAX));
-        QueryPerformanceCounter(&b);
-        g_fence_wait_ticks += (uint64_t)(b.QuadPart - a.QuadPart);
-    }
+    sl->pending = 1;
+    sl->seq = ++g_submits_issued;
     vk.frame_open = 0;
-    for (i = 0; i < vk.retired_n; i++) {
-        vkDestroyImageView(vk.dev, vk.retired[i].view, NULL);
-        vkDestroyImage(vk.dev, vk.retired[i].img, NULL);
-        vkFreeMemory(vk.dev, vk.retired[i].mem, NULL);
-    }
-    vk.retired_n = 0;
+    if (sync)
+        frames_wait_all();
 }
+
+static void frame_submit_wait(VkSemaphore wait) { frame_submit_ex(wait, VK_NULL_HANDLE, 1); }
 
 static void frame_submit(void) { frame_submit_wait(VK_NULL_HANDLE); }
 
@@ -592,16 +811,70 @@ static const char s_ps_notex[] =
     "    float4 result = input.color0;\n"
     PS_FIXED_TAIL;
 
-/* Compile HLSL to a shader module. Returns its id (1-based), 0 on failure. */
+static uint64_t usec_now(void)
+{
+    LARGE_INTEGER q, f;
+    QueryPerformanceCounter(&q);
+    QueryPerformanceFrequency(&f);
+    return (uint64_t)((double)q.QuadPart * 1e6 / (double)f.QuadPart);
+}
+
+/* The module already made from this text this run, or the slot to note it in.
+ * Different programs (a vertex program's hash, a combiner state) often
+ * translate to the same text; they share one module, and so their pipelines. */
+static ShaderSeen *shader_seen(const char *hlsl, size_t len, int vertex)
+{
+    uint8_t st = (uint8_t)(vertex ? 1 : 0);
+    uint64_t key = vkc_hash64(hlsl, len, vkc_hash64(&st, 1, VKC_HASH_SEED));
+    uint64_t check = vkc_hash64(hlsl, len, 0x9e3779b97f4a7c15ull ^ st);
+    uint32_t i;
+
+    for (i = 0; i < SEEN_SLOTS; i++) {
+        ShaderSeen *e = &vk.seen[(key + i) % SEEN_SLOTS];
+        if (!e->id) {
+            e->key = key;
+            e->check = check;
+            return e;
+        }
+        if (e->key == key && e->check == check)
+            return e;
+    }
+    return NULL;
+}
+
+/* Compile HLSL to a shader module, or take the SPIR-V an earlier run made from
+ * the same text. Returns its id (1-based), 0 on failure. */
 static uint32_t shader_make(const char *hlsl, int vertex, const char *name)
 {
     shaderc_compilation_result_t res;
     VkShaderModuleCreateInfo ci = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
-    uint32_t id = 0;
+    uint32_t id = 0, *cached;
+    size_t len = strlen(hlsl), bytes;
+    uint64_t t0 = usec_now();
+    ShaderSeen *seen = shader_seen(hlsl, len, vertex);
 
+    if (seen && seen->id) {
+        vk.spv_reused++;
+        return seen->id;
+    }
     if (vk.shader_n >= MAX_SHADERS)
         return 0;
-    res = shaderc_compile_into_spv(vk.sc, hlsl, strlen(hlsl),
+    cached = vkc_spirv_load(hlsl, len, vertex, &bytes);
+    if (cached) {
+        ci.codeSize = bytes;
+        ci.pCode = cached;
+        if (vkCreateShaderModule(vk.dev, &ci, NULL, &vk.shaders[vk.shader_n]) == VK_SUCCESS)
+            id = ++vk.shader_n;
+        free(cached);
+        if (id) {
+            vk.spv_hits++;
+            vk.spv_load_us += usec_now() - t0;
+            if (seen)
+                seen->id = id;
+            return id;
+        }
+    }
+    res = shaderc_compile_into_spv(vk.sc, hlsl, len,
                                    vertex ? shaderc_vertex_shader : shaderc_fragment_shader,
                                    name, "main", vk.sc_opts);
     if (shaderc_result_get_compilation_status(res) != shaderc_compilation_status_success) {
@@ -611,10 +884,16 @@ static uint32_t shader_make(const char *hlsl, int vertex, const char *name)
     } else {
         ci.codeSize = shaderc_result_get_length(res);
         ci.pCode = (const uint32_t *)shaderc_result_get_bytes(res);
-        if (vkCreateShaderModule(vk.dev, &ci, NULL, &vk.shaders[vk.shader_n]) == VK_SUCCESS)
+        if (vkCreateShaderModule(vk.dev, &ci, NULL, &vk.shaders[vk.shader_n]) == VK_SUCCESS) {
             id = ++vk.shader_n;
+            vkc_spirv_store(hlsl, len, vertex, ci.pCode, ci.codeSize);
+            if (seen)
+                seen->id = id;
+        }
     }
     shaderc_result_release(res);
+    vk.spv_misses++;
+    vk.spv_compile_us += usec_now() - t0;
     return id;
 }
 
@@ -624,10 +903,25 @@ static uint32_t combiner_shader(void)
     const NV2ACombinerState *st = d3d8_combiners_nv2a_state();
     uint32_t h = 2166136261u, i, slot;
     const uint8_t *b = (const uint8_t *)st;
+    /* The last two programs asked for: nearly every draw wants the one before it
+     * or the one before that, and a compare is cheaper than hashing the state. */
+    static CombEntry *mru[2];
 
     if (!st)
         return 0;
-    for (i = 0; i < sizeof *st; i++)
+    for (i = 0; i < 2; i++)
+        if (mru[i] && mru[i]->used && !memcmp(&mru[i]->st, st, sizeof *st)) {
+            CombEntry *hit = mru[i];
+            if (i) { mru[1] = mru[0]; mru[0] = hit; }
+            return hit->shader;
+        }
+    for (i = 0; i + 4 <= sizeof *st; i += 4) {
+        uint32_t w;
+        memcpy(&w, b + i, 4);
+        h = (h ^ w) * 16777619u;
+        h ^= h >> 15;
+    }
+    for (; i < sizeof *st; i++)
         h = (h ^ b[i]) * 16777619u;
     for (i = 0; i < COMB_SLOTS; i++) {
         CombEntry *e = &vk.combs[(h + i) % COMB_SLOTS];
@@ -651,14 +945,18 @@ static uint32_t combiner_shader(void)
             e->used = 1;
             e->st = *st;
             e->shader = shader_make(hlsl, 0, "ps_combiner");
+            mru[1] = mru[0]; mru[0] = e;
             return e->shader;
         }
-        if (!memcmp(&e->st, st, sizeof *st))
+        if (!memcmp(&e->st, st, sizeof *st)) {
+            mru[1] = mru[0]; mru[0] = e;
             return e->shader;
+        }
     }
     /* Full: reuse the home slot. A title has a few dozen of these. */
     slot = h % COMB_SLOTS;
     vk.combs[slot].used = 0;
+    mru[0] = mru[1] = NULL;
     return combiner_shader();
 }
 
@@ -756,6 +1054,7 @@ static VkPipeline pipeline_make(const PipeKey *k)
     };
     VkPipeline pipe = VK_NULL_HANDLE;
     uint32_t n = 0, a;
+    uint64_t t0;
 
     memset(st, 0, sizeof st);
     st[0].sType = st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -796,7 +1095,7 @@ static VkPipeline pipeline_make(const PipeKey *k)
     rs.cullMode = VK_CULL_MODE_NONE;
     rs.frontFace = VK_FRONT_FACE_CLOCKWISE;
     rs.lineWidth = 1.0f;
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    ms.rasterizationSamples = vk.samples ? vk.samples : VK_SAMPLE_COUNT_1_BIT;
 
     ds.depthTestEnable = k->ztest;
     ds.depthWriteEnable = k->ztest && k->zwrite;
@@ -834,12 +1133,17 @@ static VkPipeline pipeline_make(const PipeKey *k)
     ci.pDynamicState = &dy;
     ci.layout = vk.pl;
     ci.renderPass = vk.pass;
-    if (vkCreateGraphicsPipelines(vk.dev, VK_NULL_HANDLE, 1, &ci, NULL, &pipe) != VK_SUCCESS) {
+    t0 = usec_now();
+    if (vkCreateGraphicsPipelines(vk.dev, vk.pcache, 1, &ci, NULL, &pipe) != VK_SUCCESS) {
         static int told;
         if (told++ < 6)
             LOG("pipeline creation failed (vs %u ps %u)", k->vs, k->ps);
         return VK_NULL_HANDLE;
     }
+    vk.pipes_us += usec_now() - t0;
+    vk.pipes_made++;
+    vk.pcache_new++;
+    vk.pcache_last_new = GetTickCount64();
     return pipe;
 }
 
@@ -862,6 +1166,116 @@ static VkPipeline pipeline_get(const PipeKey *k)
             return e->pipe;
     }
     return VK_NULL_HANDLE;
+}
+
+/* ── The cache on disk ─────────────────────────────────────────────────── */
+
+/* The folder and seed, and the pipeline cache with what an earlier run saved
+ * in it. With no folder the pipeline cache still exists, for this run only. */
+static void cache_open(void)
+{
+    VkPipelineCacheCreateInfo ci = { VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
+    VkPhysicalDeviceProperties props;
+    const char *env = getenv("RECOMP_SHADER_CACHE");
+    const char *dir = env ? env : s_cache_dir;
+    unsigned spv = 0, rev = 0;
+    uint64_t seed;
+    void *data = NULL;
+    size_t size = 0;
+    static const char tag[] = "d3d8_vk spirv: hlsl, io mapping, offsets, auto locations, "
+                              "b0 t8 s16, performance, main";
+
+    if (!strcmp(dir, "0") || !strcmp(dir, "off"))
+        dir = "";
+    shaderc_get_spv_version(&spv, &rev);
+    seed = vkc_hash64(tag, sizeof tag, VKC_HASH_SEED);
+    seed = vkc_hash64(&spv, sizeof spv, vkc_hash64(&rev, sizeof rev, seed));
+    seed ^= SHADER_CACHE_VERSION;
+    if (*dir && !vkc_open(dir, seed))
+        LOG("the shader cache folder %s cannot be used; shaders are compiled every run", dir);
+
+    vkGetPhysicalDeviceProperties(vk.phys, &props);
+    memset(&vk.pcache_dev, 0, sizeof vk.pcache_dev);
+    vk.pcache_dev.vendor_id = props.vendorID;
+    vk.pcache_dev.device_id = props.deviceID;
+    vk.pcache_dev.driver_version = props.driverVersion;
+    memcpy(vk.pcache_dev.uuid, props.pipelineCacheUUID, 16);
+    data = vkc_pipeline_load(&vk.pcache_dev, &size);
+    vk.pcache_hash = data ? vkc_hash64(data, size, VKC_HASH_SEED) : 0;
+    ci.initialDataSize = size;
+    ci.pInitialData = data;
+    if (vkCreatePipelineCache(vk.dev, &ci, NULL, &vk.pcache) != VK_SUCCESS) {
+        ci.initialDataSize = 0;
+        ci.pInitialData = NULL;
+        if (vkCreatePipelineCache(vk.dev, &ci, NULL, &vk.pcache) != VK_SUCCESS)
+            vk.pcache = VK_NULL_HANDLE;
+        size = 0;
+    }
+    free(data);
+    if (vkc_enabled())
+        LOG("shader cache in %s (pipeline cache %s, %zu bytes)", dir,
+            size ? "loaded" : "empty", size);
+}
+
+/* Write the pipeline cache when it has grown. Returns 1 when written. */
+static int cache_save(const char *why)
+{
+    size_t size = 0;
+    void *data;
+    uint64_t t0 = usec_now(), h;
+    int ok = 0;
+
+    if (!vk.pcache || !vk.pcache_new || !vkc_enabled())
+        return 0;
+    vk.pcache_new = 0;
+    if (vkGetPipelineCacheData(vk.dev, vk.pcache, &size, NULL) != VK_SUCCESS || !size)
+        return 0;
+    data = malloc(size);
+    if (!data)
+        return 0;
+    if (vkGetPipelineCacheData(vk.dev, vk.pcache, &size, data) != VK_SUCCESS) {
+        free(data);
+        return 0;
+    }
+    h = vkc_hash64(data, size, VKC_HASH_SEED);
+    if (h == vk.pcache_hash) {
+        free(data);
+        return 0;
+    }
+    ok = vkc_pipeline_store(&vk.pcache_dev, data, size);
+    if (ok)
+        vk.pcache_hash = h;
+    free(data);
+    LOG("pipeline cache %s (%s): %zu bytes in %.1f ms", ok ? "written" : "not written", why, size,
+        (double)(usec_now() - t0) / 1000.0);
+    return ok;
+}
+
+static void cache_save_at_exit(void)
+{
+    if (vk.ready)
+        cache_save("exit");
+}
+
+/* At present: once no pipeline has been made for a few seconds, the ones made
+ * before are written, so a run that is killed keeps them too. */
+static void cache_tick(ULONGLONG now)
+{
+    if (vk.pcache_new && now - vk.pcache_last_new >= 3000)
+        cache_save("idle");
+}
+
+/* The cost of shaders and pipelines so far, when it changed. */
+static void cache_perf_line(void)
+{
+    uint32_t n = vk.spv_hits + vk.spv_misses + vk.spv_reused + vk.pipes_made;
+    if (n == vk.perf_printed)
+        return;
+    vk.perf_printed = n;
+    fprintf(stderr, "  [VKCACHE] shaders: %u from cache (%.1f ms), %u compiled (%.1f ms), %u reused; "
+                    "pipelines: %u made (%.1f ms)\n",
+            vk.spv_hits, (double)vk.spv_load_us / 1000.0, vk.spv_misses,
+            (double)vk.spv_compile_us / 1000.0, vk.spv_reused, vk.pipes_made, (double)vk.pipes_us / 1000.0);
 }
 
 /* ── Texture formats ───────────────────────────────────────────────────── */
@@ -1284,12 +1698,124 @@ static HRESULT __stdcall sf_LockRect(IDirect3DSurface8 *s, D3DLOCKED_RECT *lr, c
         b->pixels = malloc(bytes);
     if (!b->pixels)
         return D3DERR_INVALIDCALL;
+    ring_invalidate(&vk.readback);
     memcpy(b->pixels, vk.readback.map, bytes);
     lr->Pitch = (INT)(vk.tw * 4);
     lr->pBits = b->pixels;
     return D3D_OK;
 }
 static HRESULT __stdcall sf_UnlockRect(IDirect3DSurface8 *s) { (void)s; return D3D_OK; }
+
+/* ── Asynchronous read-back (d3d8_readback.h) ──────────────────────────── */
+
+/* The same copy as sf_LockRect, into a buffer of the slot's own, recorded in
+ * the frame's command buffer and left to complete with the frame's own
+ * submission. A slot is free, in flight (`after` is the count of submits issued
+ * when it was recorded: the copy is in the next one) or held: handed out by poll until the next
+ * poll or begin. */
+enum { RB_FREE, RB_FLIGHT, RB_HELD };
+static struct {
+    Ring     buf;
+    int      state;
+    uint64_t after, seq, tag;
+} s_rb[D3D8_READBACK_SLOTS];
+static uint64_t s_rb_seq;
+static int      s_rb_broken;        /* a slot's buffer could not be made: unsupported from then on */
+
+static void rb_release_held(void)
+{
+    int i;
+    for (i = 0; i < D3D8_READBACK_SLOTS; i++)
+        if (s_rb[i].state == RB_HELD)
+            s_rb[i].state = RB_FREE;
+}
+
+int d3d8_readback_begin(uint64_t tag)
+{
+    VkBufferImageCopy region;
+    VkDeviceSize bytes = (VkDeviceSize)vk.tw * vk.th * 4;
+    int i, slot = -1;
+
+    if (!vk.ready || s_rb_broken)
+        return -1;
+    rb_release_held();
+    for (i = 0; i < D3D8_READBACK_SLOTS && slot < 0; i++)
+        if (s_rb[i].state == RB_FREE)
+            slot = i;
+    if (slot < 0)
+        return 0;
+    if (!s_rb[slot].buf.map && !ring_make_ex(&s_rb[slot].buf, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, 1)) {
+        s_rb_broken = 1;
+        return -1;
+    }
+    frame_begin();
+    pass_end();
+    image_layout(vk.cmd, vk.color, VK_IMAGE_ASPECT_COLOR_BIT,
+                 VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    memset(&region, 0, sizeof region);
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.layerCount = 1;
+    region.imageExtent.width = vk.tw;
+    region.imageExtent.height = vk.th;
+    region.imageExtent.depth = 1;
+    vkCmdCopyImageToBuffer(vk.cmd, vk.color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           s_rb[slot].buf.buf, 1, &region);
+    image_layout(vk.cmd, vk.color, VK_IMAGE_ASPECT_COLOR_BIT,
+                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    s_rb[slot].state = RB_FLIGHT;
+    s_rb[slot].after = g_submits_issued;
+    s_rb[slot].seq = ++s_rb_seq;
+    s_rb[slot].tag = tag;
+    return 1;
+}
+
+int d3d8_readback_poll(D3D8Readback *out)
+{
+    int i, best = -1;
+
+    rb_release_held();
+    frames_reap();
+    for (i = 0; i < D3D8_READBACK_SLOTS; i++)
+        if (s_rb[i].state == RB_FLIGHT && (best < 0 || s_rb[i].seq < s_rb[best].seq))
+            best = i;
+    /* Copies finish in the order they were recorded: when the oldest has
+     * not, none has. */
+    if (best < 0 || g_submits_done <= s_rb[best].after || !out)
+        return 0;
+    s_rb[best].state = RB_HELD;
+    ring_invalidate(&s_rb[best].buf);
+    out->pixels = s_rb[best].buf.map;
+    out->pitch = (int)(vk.tw * 4);
+    out->width = vk.tw;
+    out->height = vk.th;
+    out->bgra = 0;
+    out->tag = s_rb[best].tag;
+    return 1;
+}
+
+void d3d8_readback_reset(void)
+{
+    int i, flight = 0;
+
+    for (i = 0; i < D3D8_READBACK_SLOTS; i++)
+        if (s_rb[i].state == RB_FLIGHT && g_submits_done <= s_rb[i].after)
+            flight = 1;
+    /* A copy still in the open command buffer names its buffer: finish it
+     * before the buffer goes. */
+    if (flight) {
+        if (vk.frame_open)
+            frame_submit();
+        frames_wait_all();
+    }
+    for (i = 0; i < D3D8_READBACK_SLOTS; i++) {
+        if (s_rb[i].buf.buf)
+            vkDestroyBuffer(vk.dev, s_rb[i].buf.buf, NULL);
+        if (s_rb[i].buf.mem)
+            vkFreeMemory(vk.dev, s_rb[i].buf.mem, NULL);
+        memset(&s_rb[i], 0, sizeof s_rb[i]);
+    }
+    s_rb_broken = 0;
+}
 
 static const IDirect3DSurface8Vtbl g_sf_vtbl = {
     sf_QueryInterface, sf_AddRef, sf_Release,
@@ -1309,10 +1835,17 @@ static VkSampler sampler_get(DWORD au, DWORD av, DWORD mag, DWORD min, DWORD mip
     uint32_t g = (mag == 1) ? 0 : 1, n = (min == 1) ? 0 : 1;
     /* D3DTEXF: 0 none, 1 point, 2 linear. Only a texture with a mip chain has more than level 0. */
     uint32_t m = (mip == 1 || mip == 2) ? mip : 0;
-    VkSampler *s = &vk.samplers[u][v][g][n][m];
+    /* Anisotropy only for a linearly minified texture (see d3d8_set_texture_anisotropy). */
+    uint32_t a = (n && vk.max_anisotropy >= 2.0f) ? (uint32_t)s_aniso_level : 0;
+    VkSampler *s = &vk.samplers[u][v][g][n][m][a];
 
     if (!*s) {
         VkSamplerCreateInfo ci = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+        if (a) {
+            float want = (float)(1u << a);
+            ci.anisotropyEnable = VK_TRUE;
+            ci.maxAnisotropy = want < vk.max_anisotropy ? want : vk.max_anisotropy;
+        }
         ci.magFilter = g ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
         ci.minFilter = n ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
         ci.mipmapMode = m == 2 ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
@@ -1730,6 +2263,63 @@ static void present_rect(uint32_t ww, uint32_t wh, VkOffset3D dst[2])
     dst[1].z = 1;
 }
 
+/* [display] filter "smooth (high quality)" (d3d8_present_set_filter_mode 2):
+ * a picture larger than the window is halved with exact 2x2 averages (a linear
+ * blit at 2:1 lands between four texels) until one more halving would go below
+ * the window, and only the last step, under 2:1, is a plain bilinear blit. A
+ * render scale of 4 on an 800-line Steam Deck screen goes 1920 -> 960 lines
+ * this way, then 960 -> 800, instead of skipping three lines in five. */
+#define HALF_MAX 4
+static struct {
+    VkImage        img[HALF_MAX];
+    VkDeviceMemory mem[HALF_MAX];
+    VkImageView    view[HALF_MAX];
+    uint32_t       src_w, src_h;    /* the picture size these were made for */
+} s_half;
+
+static VkImage present_halve(VkImage from, uint32_t *w, uint32_t *h, uint32_t dw, uint32_t dh)
+{
+    uint32_t sw = *w, sh = *h, k;
+
+    if (sw != s_half.src_w || sh != s_half.src_h) {
+        for (k = 0; k < HALF_MAX; k++)
+            retire(s_half.img[k], s_half.mem[k], s_half.view[k]);
+        memset(&s_half, 0, sizeof s_half);
+        s_half.src_w = sw;
+        s_half.src_h = sh;
+    }
+    for (k = 0; k < HALF_MAX && dw && dh && sw / 2 >= dw && sh / 2 >= dh; k++) {
+        VkImageBlit b;
+        uint32_t nw = sw / 2, nh = sh / 2;
+        if (!s_half.img[k]
+                && !image_make(nw, nh, VK_FORMAT_R8G8B8A8_UNORM,
+                               VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                               VK_IMAGE_ASPECT_COLOR_BIT, &s_half.img[k], &s_half.mem[k], &s_half.view[k]))
+            break;
+        image_layout(vk.cmd, s_half.img[k], VK_IMAGE_ASPECT_COLOR_BIT,
+                     VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        memset(&b, 0, sizeof b);
+        b.srcSubresource.aspectMask = b.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        b.srcSubresource.layerCount = b.dstSubresource.layerCount = 1;
+        b.srcOffsets[1].x = (int32_t)(nw * 2);      /* an odd last column or row is dropped */
+        b.srcOffsets[1].y = (int32_t)(nh * 2);
+        b.srcOffsets[1].z = 1;
+        b.dstOffsets[1].x = (int32_t)nw;
+        b.dstOffsets[1].y = (int32_t)nh;
+        b.dstOffsets[1].z = 1;
+        vkCmdBlitImage(vk.cmd, from, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       s_half.img[k], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
+        image_layout(vk.cmd, s_half.img[k], VK_IMAGE_ASPECT_COLOR_BIT,
+                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        from = s_half.img[k];
+        sw = nw;
+        sh = nh;
+    }
+    *w = sw;
+    *h = sh;
+    return from;
+}
+
 /* The Direct3D 11 backend's gamma shader: each channel through the ramp. */
 static const char s_gamma_vs[] =
     "float4 main(uint id : SV_VertexID) : SV_Position {\n"
@@ -1900,7 +2490,7 @@ static int gamma_make(void)
     ci.pDynamicState = &dy;
     ci.layout = vk.gamma_pl;
     ci.renderPass = vk.gamma_pass;
-    if (vkCreateGraphicsPipelines(vk.dev, VK_NULL_HANDLE, 1, &ci, NULL, &vk.gamma_pipe) != VK_SUCCESS) {
+    if (vkCreateGraphicsPipelines(vk.dev, vk.pcache, 1, &ci, NULL, &vk.gamma_pipe) != VK_SUCCESS) {
         vk.gamma_pipe = VK_NULL_HANDLE;
         LOG("the gamma pass could not be built; the window shows the picture without the ramp");
         return 0;
@@ -1920,6 +2510,7 @@ static int gamma_draw(void)
     if (!s_gamma_on || !gamma_make())
         return 0;
     if (s_gamma_dirty) {
+        frames_wait_all();                  /* the frame in flight reads this buffer */
         memcpy(vk.gamma_ubo.map, s_gamma, sizeof s_gamma);
         s_gamma_dirty = 0;
     }
@@ -2142,7 +2733,7 @@ static int shot_record(uint32_t image)
             vkDestroyBuffer(vk.dev, s_shot_ring.buf, NULL);
             vkFreeMemory(vk.dev, s_shot_ring.mem, NULL);
         }
-        if (!ring_make(&s_shot_ring, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
+        if (!ring_make_ex(&s_shot_ring, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, 1)) {
             s_shot_done = 1;
             return 0;
         }
@@ -2181,6 +2772,7 @@ static void shot_write(void)
         LOG("RECOMP_WINDOW_SHOT: cannot write %s", path ? path : "(nothing)");
         return;
     }
+    ring_invalidate(&s_shot_ring);
     head[0] = 14 + 40 + pixel_bytes;            /* file size */
     head[1] = 0;
     head[2] = 14 + 40;                          /* pixel data offset */
@@ -2214,9 +2806,15 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *s, const RECT *src, const
 {
     uint32_t image = 0;
     VkResult r;
-    int have = 0, shot = 0;
+    int have = 0, shot = 0, ov_on = 0;
+    /* RECOMP_VK_SYNC=1: wait for each frame before going on, as before frames were overlapped. */
+    static int force_sync = -1;
 
     (void)s; (void)src; (void)dst; (void)wnd; (void)dirty;
+    if (force_sync < 0) {
+        const char *e = getenv("RECOMP_VK_SYNC");
+        force_sync = e && *e && *e != '0';
+    }
     if (!vk.ready)
         return D3DERR_INVALIDCALL;
     {
@@ -2239,6 +2837,8 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *s, const RECT *src, const
                         (double)g_acquire_ticks * 1000.0 / (double)qf.QuadPart / frames,
                         (double)g_present_ticks * 1000.0 / (double)qf.QuadPart / frames);
             g_fence_wait_ticks = g_acquire_ticks = g_present_ticks = 0;
+            cache_perf_line();
+            cache_tick(now);
             fflush(stderr);
             frames = 0;
             last = now;
@@ -2291,9 +2891,20 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *s, const RECT *src, const
         blit.srcOffsets[1].y = (int32_t)vk.th;
         blit.srcOffsets[1].z = 1;
         present_rect(vk.swap_ext.width, vk.swap_ext.height, blit.dstOffsets);
+        if (s_linear == 2) {
+            uint32_t sw = vk.tw, sh = vk.th;
+            from = present_halve(from, &sw, &sh,
+                                 (uint32_t)(blit.dstOffsets[1].x - blit.dstOffsets[0].x),
+                                 (uint32_t)(blit.dstOffsets[1].y - blit.dstOffsets[0].y));
+            blit.srcOffsets[1].x = (int32_t)sw;
+            blit.srcOffsets[1].y = (int32_t)sh;
+        }
         vkCmdBlitImage(vk.cmd, from, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                        vk.swap_img[image], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
                        s_linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+        ov_on = s_have_overlay && s_overlay.active(s_overlay.user);
+        if (ov_on)
+            frames_wait_all();              /* the overlay rewrites buffers the frame in flight reads */
         if (overlay_draw(image))
             shot = shot_record(image);
         else
@@ -2303,7 +2914,8 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *s, const RECT *src, const
             image_layout(vk.cmd, vk.color, VK_IMAGE_ASPECT_COLOR_BIT,
                          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     }
-    frame_submit_wait(have ? vk.acquired : VK_NULL_HANDLE);
+    frame_submit_ex(have ? vk.acquired : VK_NULL_HANDLE, have ? vk.rdone[image] : VK_NULL_HANDLE,
+                    force_sync || ov_on || shot);
     if (shot && s_shot_pending)
         shot_write();
     if (have) {
@@ -2311,6 +2923,8 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *s, const RECT *src, const
         pi.swapchainCount = 1;
         pi.pSwapchains = &vk.swap;
         pi.pImageIndices = &image;
+        pi.waitSemaphoreCount = 1;
+        pi.pWaitSemaphores = &vk.rdone[image];
         LARGE_INTEGER qa, qb;
         QueryPerformanceCounter(&qa);
         r = vkQueuePresentKHR(vk.queue, &pi);
@@ -2658,6 +3272,24 @@ static void swapchain_make(void)
     if (!vk.surface)
         return;
     VKC(vkDeviceWaitIdle(vk.dev));
+    if (vk.slot) {
+        int k;
+        for (k = 0; k < FRAME_SLOTS; k++) {
+            FrameSlot *sl = &vk.slot[k];
+            if (sl->pending && sl->seq > g_submits_done)
+                g_submits_done = sl->seq;
+            sl->pending = 0;
+            slot_free_retired(sl);
+        }
+    }
+    {
+        int k;
+        for (k = 0; k < 8; k++)
+            if (vk.rdone[k]) {
+                vkDestroySemaphore(vk.dev, vk.rdone[k], NULL);
+                vk.rdone[k] = VK_NULL_HANDLE;
+            }
+    }
     overlay_release();
     if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(vk.phys, vk.surface, &caps) != VK_SUCCESS)
         return;
@@ -2726,6 +3358,11 @@ static void swapchain_make(void)
     } else {
         vk.swap_n = 8;
         vkGetSwapchainImagesKHR(vk.dev, vk.swap, &vk.swap_n, vk.swap_img);
+        for (i = 0; i < vk.swap_n && i < 8; i++)
+            if (!vk.rdone[i]) {
+                VkSemaphoreCreateInfo sci = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+                VKC(vkCreateSemaphore(vk.dev, &sci, NULL, &vk.rdone[i]));
+            }
         vk.swap_ext = ci.imageExtent;
         vk.swap_fmt = ci.imageFormat;
         LOG("swap chain %ux%u, %u images, present mode %d", ci.imageExtent.width,
@@ -2829,6 +3466,20 @@ static int device_make(void)
     qci.queueFamilyIndex = vk.qfam;
     qci.queueCount = 1;
     qci.pQueuePriorities = &prio;
+    {
+        /* Anisotropic filtering is an optional feature ([display] anisotropy);
+         * every desktop GPU and MoltenVK has it. */
+        static VkPhysicalDeviceFeatures want;
+        VkPhysicalDeviceFeatures have;
+        memset(&want, 0, sizeof want);
+        vkGetPhysicalDeviceFeatures(vk.phys, &have);
+        if (have.samplerAnisotropy) {
+            want.samplerAnisotropy = VK_TRUE;
+            vk.max_anisotropy = props.limits.maxSamplerAnisotropy;
+        }
+        LOG("anisotropic filtering: up to %.0fx", (double)vk.max_anisotropy);
+        dci.pEnabledFeatures = &want;
+    }
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
     dci.enabledExtensionCount = n_dev;
@@ -2844,14 +3495,54 @@ static int device_make(void)
     return 1;
 }
 
+/* A second set of the per-frame objects, the same as resources_make makes for the first. */
+static int slot_make(FrameSlot *sl)
+{
+    VkCommandPoolCreateInfo pci = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+    VkCommandBufferAllocateInfo cai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    VkSemaphoreCreateInfo sci = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+    VkDescriptorPoolSize ps[3];
+    VkDescriptorPoolCreateInfo dpci = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+    VkCommandBuffer cbs[2];
+
+    pci.queueFamilyIndex = vk.qfam;
+    pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    if (vkCreateCommandPool(vk.dev, &pci, NULL, &sl->pool) != VK_SUCCESS)
+        return 0;
+    cai.commandPool = sl->pool;
+    cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cai.commandBufferCount = 2;
+    if (vkAllocateCommandBuffers(vk.dev, &cai, cbs) != VK_SUCCESS)
+        return 0;
+    sl->cmd = cbs[0];
+    sl->cmd_up = cbs[1];
+    if (vkCreateFence(vk.dev, &fci, NULL, &sl->fence) != VK_SUCCESS
+            || vkCreateSemaphore(vk.dev, &sci, NULL, &sl->acquired) != VK_SUCCESS)
+        return 0;
+    ps[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC; ps[0].descriptorCount = 3 * 8192;
+    ps[1].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;          ps[1].descriptorCount = STAGES * 8192;
+    ps[2].type = VK_DESCRIPTOR_TYPE_SAMPLER;                ps[2].descriptorCount = STAGES * 8192;
+    dpci.maxSets = 8192;
+    dpci.poolSizeCount = 3;
+    dpci.pPoolSizes = ps;
+    if (vkCreateDescriptorPool(vk.dev, &dpci, NULL, &sl->dpool) != VK_SUCCESS)
+        return 0;
+    return ring_make(&sl->vtx, 48u << 20, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT)
+        && ring_make(&sl->idx, 4u << 20, VK_BUFFER_USAGE_INDEX_BUFFER_BIT)
+        && ring_make(&sl->ubo, 16u << 20, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)
+        && ring_make(&sl->stage, 64u << 20, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+}
+
 static int resources_make(void)
 {
     VkCommandPoolCreateInfo pci = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
     VkCommandBufferAllocateInfo cai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
     VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-    VkAttachmentDescription att[2];
+    VkAttachmentDescription att[3];
     VkAttachmentReference cref = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
     VkAttachmentReference dref = { 1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
+    VkAttachmentReference rref = { 2, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
     VkSubpassDescription sub;
     VkRenderPassCreateInfo rpci = { VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
     VkFramebufferCreateInfo fbci = { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
@@ -2862,7 +3553,7 @@ static int resources_make(void)
     VkDescriptorPoolCreateInfo dpci = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
     VkFormatProperties fp;
     VkCommandBuffer cbs[2];
-    VkImageView views[2];
+    VkImageView views[3];
     VkImageAspectFlags daspect = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
     VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
@@ -2894,12 +3585,36 @@ static int resources_make(void)
             return 0;
     }
 
+    {
+        /* The most samples up to the ones asked for that colour, depth and
+         * stencil attachments all support; 1 (off) when none do. */
+        VkPhysicalDeviceProperties p;
+        VkSampleCountFlags ok;
+        unsigned n = s_msaa_want > 8 ? 8 : s_msaa_want;
+        vkGetPhysicalDeviceProperties(vk.phys, &p);
+        ok = p.limits.framebufferColorSampleCounts & p.limits.framebufferDepthSampleCounts
+           & p.limits.framebufferStencilSampleCounts;
+        vk.samples = VK_SAMPLE_COUNT_1_BIT;
+        for (; n >= 2; n >>= 1)
+            if (ok & n) {
+                vk.samples = (VkSampleCountFlagBits)n;
+                break;
+            }
+        if (s_msaa_want > 1)
+            LOG("MSAA: %ux asked, %ux used", s_msaa_want, (unsigned)vk.samples);
+    }
     if (!image_make(vk.tw, vk.th, VK_FORMAT_R8G8B8A8_UNORM,
                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
                     | VK_IMAGE_USAGE_SAMPLED_BIT,
                     VK_IMAGE_ASPECT_COLOR_BIT, &vk.color, &vk.color_mem, &vk.color_view)
-            || !image_make(vk.tw, vk.th, vk.depth_fmt, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
-                           daspect, &vk.depth, &vk.depth_mem, &vk.depth_view)
+            || !image_make_samples(vk.tw, vk.th, 1, vk.samples, vk.depth_fmt,
+                                   VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                                   daspect, &vk.depth, &vk.depth_mem, &vk.depth_view)
+            || (vk.samples > VK_SAMPLE_COUNT_1_BIT
+                && !image_make_samples(vk.tw, vk.th, 1, vk.samples, VK_FORMAT_R8G8B8A8_UNORM,
+                                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                                       VK_IMAGE_ASPECT_COLOR_BIT, &vk.color_ms, &vk.color_ms_mem,
+                                       &vk.color_ms_view))
             || !image_make(1, 1, VK_FORMAT_R8G8B8A8_UNORM,
                            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                            VK_IMAGE_ASPECT_COLOR_BIT, &vk.dummy, &vk.dummy_mem, &vk.dummy_view))
@@ -2917,21 +3632,32 @@ static int resources_make(void)
     }
     att[0].initialLayout = att[0].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     att[1].initialLayout = att[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    att[0].samples = att[1].samples = vk.samples;
+    /* With MSAA the single-sample target is the resolve: written whole at the
+     * end of each pass, never loaded. */
+    att[2] = att[0];
+    att[2].samples = VK_SAMPLE_COUNT_1_BIT;
+    att[2].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att[2].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att[2].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     memset(&sub, 0, sizeof sub);
     sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     sub.colorAttachmentCount = 1;
     sub.pColorAttachments = &cref;
     sub.pDepthStencilAttachment = &dref;
-    rpci.attachmentCount = 2;
+    if (vk.samples > VK_SAMPLE_COUNT_1_BIT)
+        sub.pResolveAttachments = &rref;
+    rpci.attachmentCount = vk.samples > VK_SAMPLE_COUNT_1_BIT ? 3 : 2;
     rpci.pAttachments = att;
     rpci.subpassCount = 1;
     rpci.pSubpasses = &sub;
     if (vkCreateRenderPass(vk.dev, &rpci, NULL, &vk.pass) != VK_SUCCESS)
         return 0;
-    views[0] = vk.color_view;
+    views[0] = vk.samples > VK_SAMPLE_COUNT_1_BIT ? vk.color_ms_view : vk.color_view;
     views[1] = vk.depth_view;
+    views[2] = vk.color_view;
     fbci.renderPass = vk.pass;
-    fbci.attachmentCount = 2;
+    fbci.attachmentCount = rpci.attachmentCount;
     fbci.pAttachments = views;
     fbci.width = vk.tw;
     fbci.height = vk.th;
@@ -2979,8 +3705,26 @@ static int resources_make(void)
             || !ring_make(&vk.idx, 4u << 20, VK_BUFFER_USAGE_INDEX_BUFFER_BIT)
             || !ring_make(&vk.ubo, 16u << 20, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)
             || !ring_make(&vk.stage, 64u << 20, VK_BUFFER_USAGE_TRANSFER_SRC_BIT)
-            || !ring_make(&vk.readback, (VkDeviceSize)vk.tw * vk.th * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT))
+            || !ring_make_ex(&vk.readback, (VkDeviceSize)vk.tw * vk.th * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, 1))
         return 0;
+    /* The frame slots: the first is what was just made, the others are new. */
+    vk.slot = calloc(FRAME_SLOTS, sizeof *vk.slot);
+    if (!vk.slot)
+        return 0;
+    vk.slot[0].pool = vk.pool;
+    vk.slot[0].cmd = vk.cmd;
+    vk.slot[0].cmd_up = vk.cmd_up;
+    vk.slot[0].fence = vk.fence;
+    vk.slot[0].acquired = vk.acquired;
+    vk.slot[0].dpool = vk.dpool;
+    vk.slot[0].vtx = vk.vtx;
+    vk.slot[0].idx = vk.idx;
+    vk.slot[0].ubo = vk.ubo;
+    vk.slot[0].stage = vk.stage;
+    vk.cur = 0;
+    for (i = 1; i < FRAME_SLOTS; i++)
+        if (!slot_make(&vk.slot[i]))
+            return 0;
 
     /* The attachments into the layouts the render pass expects, and the
      * stand-in for an empty stage cleared to nothing, as Direct3D samples it. */
@@ -2996,6 +3740,13 @@ static int resources_make(void)
                      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
         image_layout(vk.cmd, vk.depth, daspect, VK_IMAGE_LAYOUT_UNDEFINED,
                      VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        if (vk.color_ms) {
+            image_layout(vk.cmd, vk.color_ms, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            vkCmdClearColorImage(vk.cmd, vk.color_ms, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &range);
+            image_layout(vk.cmd, vk.color_ms, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        }
         image_layout(vk.cmd, vk.dummy, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         vkCmdClearColorImage(vk.cmd, vk.dummy, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &range);
@@ -3020,6 +3771,7 @@ static int resources_make(void)
     shaderc_compile_options_set_binding_base(vk.sc_opts, shaderc_uniform_kind_texture, 8);
     shaderc_compile_options_set_binding_base(vk.sc_opts, shaderc_uniform_kind_sampler, 16);
     shaderc_compile_options_set_optimization_level(vk.sc_opts, shaderc_optimization_level_performance);
+    cache_open();
     vk.vs_fixed = shader_make(s_vs_fixed, 1, "vs_fixed");
     vk.ps_tex = shader_make(s_ps_tex, 0, "ps_tex");
     vk.ps_notex = shader_make(s_ps_notex, 0, "ps_notex");
@@ -3060,6 +3812,11 @@ static HRESULT __stdcall d3d_CreateDevice(IDirect3D8 *s, UINT adapter, DWORD dev
     vk.rs[D3DRS_ALPHAFUNC] = D3DCMP_ALWAYS;
     vk.rs[D3DRS_COLORWRITEENABLE] = 0xF;
     vk.ready = 1;
+    {
+        static int registered;
+        if (!registered++)
+            atexit(cache_save_at_exit);
+    }
     if (vk.surface)
         swapchain_make();
     LOG("ready: %ux%u target (%ux%u at scale %u), depth format %s", vk.tw, vk.th, vk.lw, vk.lh,

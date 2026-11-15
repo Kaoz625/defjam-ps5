@@ -24,6 +24,7 @@
 #include <strings.h>
 #include <stdio.h>
 #include <time.h>
+#include <stdarg.h>
 #include <signal.h>
 #include <errno.h>
 #include <unistd.h>
@@ -35,6 +36,7 @@
 #include <sys/stat.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <mach/thread_switch.h>
 #include <pthread/qos.h>
 #else
 #include <sys/sysinfo.h>
@@ -82,7 +84,7 @@ VOID  SetLastError(DWORD code)      { t_last_error = code; }
 #define GC_SIGNAL    SIGUSR2
 #define GC_SLICE_NS  1000000L
 
-typedef struct {
+typedef struct gc_thread {
     int holding;                    /* has the token */
     int urgent;                     /* interrupts the holder at once */
     volatile sig_atomic_t pending;  /* asked to hand over while in host code */
@@ -92,7 +94,18 @@ typedef struct {
     void *obj;                      /* its w32_object, for its priority */
     int via_urgent;                 /* holds the CPU outside the ticket order */
     int yielding;                   /* gave the CPU up on purpose: queue behind the rest */
+    /* What guest_turn_probe() reports: set by the thread itself, read under gc_lock. */
+    int state;                      /* GC_OFF, GC_TURN, GC_RUN */
+    struct timespec state_at;       /* when it entered that state */
+    pthread_t self;
+    const void *start;              /* the host entry of the guest routine it runs */
+    uint32_t start_ctx;
+    const volatile uint32_t *caller;    /* its g_xbox_kernel_caller */
+    int gone;                       /* the thread has ended; kept so a probe never reads freed memory */
+    struct gc_thread *next;         /* every thread that has joined */
 } gc_thread;
+
+enum { GC_OFF, GC_TURN, GC_RUN };
 
 static pthread_mutex_t gc_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  gc_cond = PTHREAD_COND_INITIALIZER;
@@ -112,6 +125,13 @@ static int       gc_urgent_waiting;         /* urgent threads waiting for the CP
 static pthread_key_t  gc_key;
 static pthread_once_t gc_once = PTHREAD_ONCE_INIT;
 static __thread gc_thread *t_gc;
+static gc_thread *gc_all;                   /* under gc_lock */
+
+static void gc_set_state(gc_thread *t, int state)
+{
+    t->state = state;
+    clock_gettime(CLOCK_MONOTONIC, &t->state_at);
+}
 
 static void gc_release(gc_thread *t)
 {
@@ -119,6 +139,7 @@ static void gc_release(gc_thread *t)
     pthread_mutex_lock(&gc_lock);
     t->holding = 0;
     gc_held = 0;
+    gc_set_state(t, GC_OFF);
     if (t->via_urgent)
         t->via_urgent = 0;          /* took no ticket */
     else
@@ -146,6 +167,7 @@ static void gc_acquire(gc_thread *t, int waited)
     if (timed)
         clock_gettime(CLOCK_MONOTONIC, &t0);
     pthread_mutex_lock(&gc_lock);
+    gc_set_state(t, GC_TURN);
     if (urgent)
         gc_urgent_waiting++;
     else
@@ -172,6 +194,7 @@ static void gc_acquire(gc_thread *t, int waited)
     gc_holder = pthread_self();
     gc_held = 1;
     t->holding = 1;
+    gc_set_state(t, GC_RUN);
     pthread_mutex_unlock(&gc_lock);
     if (timed) {
         long ms;
@@ -216,7 +239,10 @@ static void gc_thread_gone(void *p)
     if (t->holding)
         gc_release(t);
     gc_unbind(t);
-    free(t);
+    pthread_mutex_lock(&gc_lock);
+    t->gone = 1;                    /* stays on gc_all: a probe may hold a pointer to it */
+    t->caller = NULL;
+    pthread_mutex_unlock(&gc_lock);
 }
 
 static void gc_setup(void)
@@ -243,7 +269,12 @@ void guest_turn_join(void)
         return;
     pthread_setspecific(gc_key, t);
     t_gc = t;
+    t->self = pthread_self();
     gc_bind_self(t);
+    pthread_mutex_lock(&gc_lock);
+    t->next = gc_all;
+    gc_all = t;
+    pthread_mutex_unlock(&gc_lock);
 #if defined(__APPLE__)
     /* The default QoS left a holder off the CPU for tens of milliseconds at a time
      * (0.2 ms of CPU in 48) while a busy host thread logged or a scene loaded,
@@ -376,6 +407,392 @@ static void gc_yield(void)
 }
 
 /* ===================================================================== */
+/* Hitch probe: who holds the guest CPU, and where every thread is       */
+/* ===================================================================== */
+
+/*
+ * A stall of 100-300 ms once a minute does not show in an aggregate profile.
+ * The play-test recorder calls guest_turn_probe() when no frame has been
+ * presented for a while, and keeps what it says with the hitch: which thread
+ * holds the guest CPU, how long it has, the guest call site of the kernel call
+ * it is in (g_xbox_kernel_caller), the last indirect calls, and the native
+ * stack of that thread and of every other thread in the process.
+ *
+ * Darwin only (the other hosts pin guest threads to a CPU and have no token).
+ * Threads are sampled from outside with Mach, one at a time: suspended, their
+ * registers read and their frame-pointer chain copied with vm_read (which
+ * cannot fault), resumed. Nothing that takes a lock runs while one is
+ * suspended; names are looked up afterwards with dladdr. Frames in the
+ * program itself also carry their offset from its load address ("exe+0x..."),
+ * because dladdr names only exported symbols: scripts/hitch-probes.py turns
+ * them into functions and lines with atos.
+ */
+static const volatile uint32_t *gc_icall_ring, *gc_icall_idx;
+static const char *gc_extra_key;
+static int (*gc_extra_fn)(char *out, size_t size);
+
+void guest_turn_note_extra(const char *key, int (*fn)(char *out, size_t size))
+{
+    gc_extra_key = key;
+    gc_extra_fn = fn;
+}
+
+void guest_turn_note_caller(const volatile uint32_t *slot)
+{
+    if (t_gc)
+        t_gc->caller = slot;
+}
+
+void guest_turn_note_start(const void *entry, uint32_t ctx)
+{
+    if (t_gc) {
+        t_gc->start = entry;
+        t_gc->start_ctx = ctx;
+    }
+}
+
+void guest_turn_note_icall_ring(const volatile uint32_t *ring, const volatile uint32_t *idx)
+{
+    gc_icall_ring = ring;
+    gc_icall_idx = idx;
+}
+
+#if defined(__APPLE__)
+#include <dlfcn.h>
+#include <mach-o/dyld.h>
+
+#define PROBE_THREADS 96
+#define PROBE_FRAMES  40
+
+typedef struct {
+    thread_act_t port;
+    char name[48];
+    int gc;                         /* -1: not a guest thread; else GC_OFF/TURN/RUN */
+    int holder, pending;
+    long state_ms, asked_ms;
+    uint32_t caller;
+    const void *start;
+    uint32_t start_ctx;
+    int run_state;
+    long cpu_ms;
+    int pri, depressed;
+    int nframes;
+    uintptr_t pc[PROBE_FRAMES];
+} probe_thread;
+
+typedef struct { char *p; size_t left; } jbuf;
+
+static void jput(jbuf *b, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void jput(jbuf *b, const char *fmt, ...)
+{
+    va_list ap;
+    int n;
+    if (b->left <= 1)
+        return;
+    va_start(ap, fmt);
+    n = vsnprintf(b->p, b->left, fmt, ap);
+    va_end(ap);
+    if (n < 0)
+        return;
+    if ((size_t)n >= b->left)
+        n = (int)b->left - 1;
+    b->p += n;
+    b->left -= (size_t)n;
+}
+
+static int probe_read(uintptr_t addr, void *out, size_t n)
+{
+    mach_vm_size_t got = 0;
+    return mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)addr, n,
+                                  (mach_vm_address_t)(uintptr_t)out, &got) == KERN_SUCCESS && got == n;
+}
+
+static long ms_since(const struct timespec *a, const struct timespec *now)
+{
+    return (long)(now->tv_sec - a->tv_sec) * 1000 + (now->tv_nsec - a->tv_nsec) / 1000000;
+}
+
+/* Registers and frame-pointer chain of a suspended thread. */
+static int probe_walk(thread_act_t th, uintptr_t *pcs, int max)
+{
+    const uintptr_t mask = ((uintptr_t)1 << 47) - 1;   /* user addresses; drops any pointer signature */
+    uintptr_t fp, frame[2];
+    int n = 0;
+#if defined(__arm64__) || defined(__aarch64__)
+    arm_thread_state64_t st;
+    mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+    if (thread_get_state(th, ARM_THREAD_STATE64, (thread_state_t)&st, &cnt) != KERN_SUCCESS)
+        return 0;
+    pcs[n++] = (uintptr_t)arm_thread_state64_get_pc(st) & mask;
+    /* A leaf (a system call's stub) has not saved its return address yet. */
+    pcs[n++] = (uintptr_t)arm_thread_state64_get_lr(st) & mask;
+    fp = (uintptr_t)arm_thread_state64_get_fp(st);
+#elif defined(__x86_64__)
+    x86_thread_state64_t st;
+    mach_msg_type_number_t cnt = x86_THREAD_STATE64_COUNT;
+    if (thread_get_state(th, x86_THREAD_STATE64, (thread_state_t)&st, &cnt) != KERN_SUCCESS)
+        return 0;
+    pcs[n++] = (uintptr_t)st.__rip;
+    fp = (uintptr_t)st.__rbp;
+#else
+    return 0;
+#endif
+    while (n < max && fp && !(fp & 7) && probe_read(fp, frame, sizeof frame)) {
+        uintptr_t ret = frame[1] & mask;
+        if (!ret)
+            break;
+        if (!(n == 2 && ret == pcs[1]))
+            pcs[n++] = ret;
+        if (frame[0] <= fp)
+            break;
+        fp = frame[0];
+    }
+    return n;
+}
+
+/* dladdr scans a symbol table, and a stall's stacks repeat from one probe to the
+ * next: names are kept by address (under the probe's lock). */
+#define PROBE_NAMES 4096
+static struct { uintptr_t pc; char s[176]; } probe_names[PROBE_NAMES];
+
+static void probe_frame_name(jbuf *b, uintptr_t pc, uintptr_t exe)
+{
+    Dl_info di;
+    const char *lib;
+
+    if (dladdr((const void *)pc, &di) && di.dli_fbase) {
+        lib = di.dli_fname ? strrchr(di.dli_fname, '/') : NULL;
+        lib = lib ? lib + 1 : (di.dli_fname ? di.dli_fname : "?");
+        if ((uintptr_t)di.dli_fbase == exe) {
+            if (di.dli_sname)
+                jput(b, "\"%s+0x%lx exe+0x%lx\"", di.dli_sname,
+                     (unsigned long)(pc - (uintptr_t)di.dli_saddr), (unsigned long)(pc - exe));
+            else
+                jput(b, "\"exe+0x%lx\"", (unsigned long)(pc - exe));
+        } else if (di.dli_sname) {
+            jput(b, "\"%s`%s+0x%lx\"", lib, di.dli_sname, (unsigned long)(pc - (uintptr_t)di.dli_saddr));
+        } else {
+            jput(b, "\"%s+0x%lx\"", lib, (unsigned long)(pc - (uintptr_t)di.dli_fbase));
+        }
+    } else {
+        jput(b, "\"0x%lx\"", (unsigned long)pc);
+    }
+}
+
+static void probe_frame(jbuf *b, uintptr_t pc, uintptr_t exe)
+{
+    size_t h = (size_t)((pc >> 2) * 0x9E3779B97F4A7C15ull >> 52) & (PROBE_NAMES - 1);
+    jbuf nb;
+
+    if (!pc) {
+        jput(b, "\"0x0\"");
+        return;
+    }
+    if (probe_names[h].pc != pc) {
+        nb.p = probe_names[h].s;
+        nb.left = sizeof probe_names[h].s;
+        probe_frame_name(&nb, pc, exe);
+        if (nb.left <= 1)       /* cut short: close the string */
+            memcpy(probe_names[h].s + sizeof probe_names[h].s - 2, "\"", 2);
+        probe_names[h].pc = pc;
+    }
+    jput(b, "%s", probe_names[h].s);
+}
+
+static const char *probe_run_state(int s)
+{
+    switch (s) {
+    case TH_STATE_RUNNING:         return "running";
+    case TH_STATE_STOPPED:         return "stopped";
+    case TH_STATE_WAITING:         return "waiting";
+    case TH_STATE_UNINTERRUPTIBLE: return "uninterruptible";
+    case TH_STATE_HALTED:          return "halted";
+    default:                       return "?";
+    }
+}
+
+static void probe_thread_json(jbuf *b, const probe_thread *p, int frames, uintptr_t exe, int icall)
+{
+    static const char *gcs[] = { "off", "turn", "run" };
+    Dl_info di;
+    int i;
+
+    jput(b, "{\"name\":\"%s\"", p->name);
+    if (p->gc >= 0) {
+        jput(b, ",\"guest\":\"%s\",\"state_ms\":%ld", gcs[p->gc], p->state_ms);
+        if (p->holder)
+            jput(b, ",\"holder\":true");
+        if (p->pending)
+            jput(b, ",\"asked_ms\":%ld", p->asked_ms);
+        if (p->caller)
+            jput(b, ",\"kernel_caller\":\"0x%08X\"", p->caller);
+        if (p->start) {
+            if (dladdr(p->start, &di) && di.dli_sname)
+                jput(b, ",\"start\":\"%s\"", di.dli_sname);
+            else
+                jput(b, ",\"start\":\"exe+0x%lx\"", (unsigned long)((uintptr_t)p->start - exe));
+            jput(b, ",\"start_ctx\":\"0x%08X\"", p->start_ctx);
+        }
+        if (icall && gc_icall_ring && gc_icall_idx) {
+            /* The ring is every thread's; with one guest CPU its newest entries are the holder's. */
+            uint32_t idx = *gc_icall_idx;
+            jput(b, ",\"icall\":[");
+            for (i = 0; i < 16; i++)
+                jput(b, "%s\"0x%08X\"", i ? "," : "", gc_icall_ring[(idx - 1 - (uint32_t)i) & 15]);
+            jput(b, "]");
+        }
+    }
+    jput(b, ",\"run\":\"%s\",\"cpu_ms\":%ld,\"pri\":%d%s,\"stack\":[", probe_run_state(p->run_state),
+         p->cpu_ms, p->pri, p->depressed ? ",\"depressed\":true" : "");
+    for (i = 0; i < p->nframes && i < frames; i++) {
+        if (i)
+            jput(b, ",");
+        probe_frame(b, p->pc[i], exe);
+    }
+    jput(b, "]}");
+}
+
+int guest_turn_probe(char *holder, size_t holder_size, char *all, size_t all_size)
+{
+    static pthread_mutex_t probe_lock = PTHREAD_MUTEX_INITIALIZER;
+    static probe_thread th[PROBE_THREADS];
+    thread_act_array_t list = NULL;
+    mach_msg_type_number_t count = 0, i;
+    thread_act_t me = mach_thread_self();
+    struct timespec now, t0, t1;
+    static char extra[512];
+    uintptr_t exe = (uintptr_t)_dyld_get_image_header(0);
+    int n = 0, k, held, holder_i = -1;
+    pthread_t holder_pt;
+    jbuf b;
+
+    if (holder && holder_size) holder[0] = 0;
+    if (all && all_size) all[0] = 0;
+    pthread_mutex_lock(&probe_lock);
+    if (task_threads(mach_task_self(), &list, &count) != KERN_SUCCESS) {
+        pthread_mutex_unlock(&probe_lock);
+        mach_port_deallocate(mach_task_self(), me);
+        return 0;
+    }
+    /* Names and guest-CPU state first, while no thread is stopped. */
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    pthread_mutex_lock(&gc_lock);
+    held = gc_held;
+    holder_pt = gc_holder;
+    pthread_mutex_unlock(&gc_lock);
+    for (i = 0; i < count && n < PROBE_THREADS; i++) {
+        probe_thread *p = &th[n];
+        pthread_t pt;
+        gc_thread *g;
+
+        if (list[i] == me)
+            continue;
+        memset(p, 0, sizeof *p);
+        p->port = list[i];
+        p->gc = -1;
+        pt = pthread_from_mach_thread_np(list[i]);
+        if (pt) {
+            pthread_getname_np(pt, p->name, sizeof p->name);
+            for (k = 0; p->name[k]; k++)
+                if (p->name[k] == '"' || p->name[k] == '\\' || (unsigned char)p->name[k] < 32)
+                    p->name[k] = '_';
+            pthread_mutex_lock(&gc_lock);
+            for (g = gc_all; g; g = g->next) {
+                if (g->gone || !pthread_equal(g->self, pt))
+                    continue;
+                p->gc = g->state;
+                p->state_ms = ms_since(&g->state_at, &now);
+                p->holder = held && pthread_equal(holder_pt, pt);
+                p->pending = g->pending;
+                if (g->pending)
+                    p->asked_ms = ms_since(&g->asked_at, &now);
+                p->start = g->start;
+                p->start_ctx = g->start_ctx;
+                if (g->caller)
+                    probe_read((uintptr_t)g->caller, &p->caller, sizeof p->caller);
+                break;
+            }
+            pthread_mutex_unlock(&gc_lock);
+        }
+        if (p->holder)
+            holder_i = n;
+        n++;
+    }
+    /* Then each thread's stack, one stopped at a time. */
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (k = 0; k < n; k++) {
+        probe_thread *p = &th[k];
+        thread_basic_info_data_t bi;
+        mach_msg_type_number_t bc = THREAD_BASIC_INFO_COUNT;
+
+        if (thread_info(p->port, THREAD_BASIC_INFO, (thread_info_t)&bi, &bc) == KERN_SUCCESS) {
+            p->run_state = bi.run_state;
+            p->cpu_ms = (long)(bi.user_time.seconds + bi.system_time.seconds) * 1000 +
+                        (bi.user_time.microseconds + bi.system_time.microseconds) / 1000;
+        }
+        {
+            policy_timeshare_info_data_t ts;
+            mach_msg_type_number_t tc = POLICY_TIMESHARE_INFO_COUNT;
+            if (thread_info(p->port, THREAD_SCHED_TIMESHARE_INFO, (thread_info_t)&ts, &tc) == KERN_SUCCESS) {
+                p->pri = ts.cur_priority;
+                p->depressed = ts.depressed;
+            } else {
+                p->pri = -1;
+            }
+        }
+        if (thread_suspend(p->port) == KERN_SUCCESS) {
+            p->nframes = probe_walk(p->port, p->pc, PROBE_FRAMES);
+            thread_resume(p->port);
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    for (i = 0; i < count; i++)
+        mach_port_deallocate(mach_task_self(), list[i]);
+    vm_deallocate(mach_task_self(), (vm_address_t)list, count * sizeof *list);
+    mach_port_deallocate(mach_task_self(), me);
+
+    extra[0] = 0;
+    if (gc_extra_fn && gc_extra_key && gc_extra_fn(extra, sizeof extra) <= 0)
+        extra[0] = 0;
+    if (holder && holder_size) {
+        b.p = holder; b.left = holder_size;
+        if (holder_i >= 0) {
+            probe_thread_json(&b, &th[holder_i], PROBE_FRAMES, exe, 1);
+        } else {
+            jput(&b, "{\"name\":null,\"held\":%d}", held);
+        }
+        if (extra[0] && b.p > holder && b.p[-1] == '}') {
+            b.p--; b.left++;            /* reopen the object for the extra */
+            jput(&b, ",\"%s\":%s}", gc_extra_key, extra);
+        }
+    }
+    if (all && all_size) {
+        b.p = all; b.left = all_size;
+        jput(&b, "{\"exe\":\"0x%lx\",\"sample_us\":%ld,", (unsigned long)exe,
+             (long)(t1.tv_sec - t0.tv_sec) * 1000000 + (t1.tv_nsec - t0.tv_nsec) / 1000);
+        if (extra[0])
+            jput(&b, "\"%s\":%s,", gc_extra_key, extra);
+        jput(&b, "\"threads\":[");
+        for (k = 0; k < n; k++) {
+            if (k)
+                jput(&b, ",");
+            probe_thread_json(&b, &th[k], PROBE_FRAMES, exe, 0);
+        }
+        jput(&b, "]}");
+    }
+    pthread_mutex_unlock(&probe_lock);
+    return n;
+}
+#else
+int guest_turn_probe(char *holder, size_t holder_size, char *all, size_t all_size)
+{
+    if (holder && holder_size) holder[0] = 0;
+    if (all && all_size) all[0] = 0;
+    return 0;
+}
+#endif
+
+/* ===================================================================== */
 /* Interlocked atomics                                                   */
 /* ===================================================================== */
 
@@ -383,6 +800,9 @@ LONG InterlockedIncrement(volatile LONG *p)        { return __atomic_add_fetch(p
 LONG InterlockedDecrement(volatile LONG *p)        { return __atomic_sub_fetch(p, 1, __ATOMIC_SEQ_CST); }
 LONG InterlockedExchange(volatile LONG *p, LONG v) { return __atomic_exchange_n(p, v, __ATOMIC_SEQ_CST); }
 LONG InterlockedExchangeAdd(volatile LONG *p, LONG v) { return __atomic_fetch_add(p, v, __ATOMIC_SEQ_CST); }
+
+LONG InterlockedAnd(volatile LONG *p, LONG v)      { return __atomic_fetch_and(p, v, __ATOMIC_SEQ_CST); }
+LONG InterlockedOr(volatile LONG *p, LONG v)       { return __atomic_fetch_or(p, v, __ATOMIC_SEQ_CST); }
 
 LONG InterlockedCompareExchange(volatile LONG *p, LONG xchg, LONG cmp)
 {
@@ -732,6 +1152,18 @@ const char *w32_handle_path(HANDLE h)
     return (o && o->kind == K_FILE) ? o->file_path : NULL;
 }
 
+void w32_handle_set_path(HANDLE h, const char *host_path)
+{
+    w32_object *o = (w32_object *)h;
+    char *old;
+
+    if (!o || o->kind != K_FILE)
+        return;
+    old = o->file_path;
+    o->file_path = host_path ? strdup(host_path) : NULL;
+    free(old);
+}
+
 BOOL CloseHandle(HANDLE h)
 {
     if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS ||
@@ -1056,11 +1488,56 @@ BOOL ReleaseMutex(HANDLE h)
 /* Threads                                                               */
 /* ===================================================================== */
 
+/* Win32 gives a new thread the process's CPU mask; pthread_create copies
+ * the creator's. A guest thread pinned to one core (xbox_GuestThreadPin)
+ * would otherwise hand that core to every host thread it creates, the
+ * kernel timer thread from KeSetTimer among them. The mask is taken once,
+ * from the first thread to ask, before any pin. */
+static DWORD_PTR s_process_mask;
+
+static DWORD_PTR process_mask_capture(void)
+{
+    DWORD_PTR mask = 0;
+    if (s_process_mask)
+        return s_process_mask;
+#if defined(__linux__)
+    {
+        cpu_set_t set;
+        int i;
+        if (sched_getaffinity(0, sizeof set, &set) == 0)
+            for (i = 0; i < (int)(8 * sizeof mask) && i < CPU_SETSIZE; i++)
+                if (CPU_ISSET(i, &set))
+                    mask |= (DWORD_PTR)1 << i;
+    }
+#endif
+    if (!mask) {
+        long n = sysconf(_SC_NPROCESSORS_ONLN);
+        if (n < 1) n = 1;
+        if (n >= (long)(8 * sizeof mask)) n = (long)(8 * sizeof mask) - 1;
+        mask = ((DWORD_PTR)1 << n) - 1;
+    }
+    s_process_mask = mask;
+    return mask;
+}
+
 static void *thread_trampoline(void *arg)
 {
     w32_object *o = (w32_object *)arg;
     t_self_obj = o;
     t_tid      = o->tid;
+
+#if defined(__linux__)
+    /* The process mask, not the creator's: see process_mask_capture. */
+    if (s_process_mask) {
+        cpu_set_t set;
+        int i;
+        CPU_ZERO(&set);
+        for (i = 0; i < (int)(8 * sizeof s_process_mask) && i < CPU_SETSIZE; i++)
+            if (s_process_mask & ((DWORD_PTR)1 << i))
+                CPU_SET(i, &set);
+        pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+    }
+#endif
 
     /* CREATE_SUSPENDED gate */
     pthread_mutex_lock(&o->lock);
@@ -1153,13 +1630,22 @@ DWORD ResumeThread(HANDLE h)
 
 DWORD SuspendThread(HANDLE h)
 {
-    /* True mid-run suspension is not supported on POSIX; only the
-     * CREATE_SUSPENDED start gate is. Track the count for ResumeThread. */
+    /* POSIX cannot stop another thread at an arbitrary point, so suspending
+     * one only counts, for ResumeThread. A thread suspending *itself* is a
+     * different matter: it is at a known point, and it parks on the same gate
+     * CREATE_SUSPENDED uses until a ResumeThread brings the count to zero.
+     * Worker pools idle that way; returning at once turned one title's pool
+     * into a suspend/check spin of millions of calls a second. */
+    if (h == PSEUDO_CURRENT_THREAD) h = GetCurrentThread();
     w32_object *o = (w32_object *)h;
-    if (!o || o->kind != K_THREAD) return (DWORD)-1;
+    if (!o || o == (w32_object *)PSEUDO_CURRENT_THREAD || o->kind != K_THREAD)
+        return (DWORD)-1;
     pthread_mutex_lock(&o->lock);
     DWORD prev = (DWORD)o->suspend_count;
     o->suspend_count++;
+    if (o == t_self_obj)
+        while (o->suspend_count > 0)
+            pthread_cond_wait(&o->gate, &o->lock);
     pthread_mutex_unlock(&o->lock);
     return prev;
 }
@@ -1197,7 +1683,80 @@ int GetThreadPriority(HANDLE h)
     return (o && o->kind == K_THREAD) ? o->priority : THREAD_PRIORITY_NORMAL;
 }
 
-VOID SwitchToThread(void) { gc_yield(); sched_yield(); }
+DWORD_PTR SetThreadAffinityMask(HANDLE h, DWORD_PTR mask)
+{
+    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
+    pthread_t th = (o && o->kind == K_THREAD) ? o->thread : pthread_self();
+    (void)th;
+    if (!mask)
+        return 0;
+    process_mask_capture();   /* before this thread's mask shrinks */
+#if defined(__linux__)
+    {
+        DWORD_PTR prev = 0;
+        cpu_set_t set;
+        int i;
+        if (pthread_getaffinity_np(th, sizeof set, &set) == 0)
+            for (i = 0; i < (int)(8 * sizeof prev) && i < CPU_SETSIZE; i++)
+                if (CPU_ISSET(i, &set))
+                    prev |= (DWORD_PTR)1 << i;
+        CPU_ZERO(&set);
+        for (i = 0; i < (int)(8 * sizeof mask) && i < CPU_SETSIZE; i++)
+            if (mask & ((DWORD_PTR)1 << i))
+                CPU_SET(i, &set);
+        if (pthread_setaffinity_np(th, sizeof set, &set) != 0)
+            return 0;
+        return prev ? prev : mask;
+    }
+#else
+    /* No thread affinity on this host: macOS has only affinity tags, a
+     * hint, so the guest threads' one-core pin (RECOMP_GUEST_CPUS) does
+     * nothing here and returns 0 as a failed call would. */
+    return 0;
+#endif
+}
+
+BOOL GetProcessAffinityMask(HANDLE process, DWORD_PTR *process_mask,
+                            DWORD_PTR *system_mask)
+{
+    /* The process's mask, captured before any thread shrank its own:
+     * sched_getaffinity(0) would answer for the calling thread. */
+    DWORD_PTR mask = process_mask_capture();
+    (void)process;
+    if (process_mask) *process_mask = mask;
+    if (system_mask)  *system_mask  = mask;
+    return TRUE;
+}
+
+
+/* A yield that lets another thread run without falling behind every thread on the host.
+ *
+ * Darwin's sched_yield() is swtch_pri(0): it depresses the caller to priority 0 until it
+ * next runs. A thread that yields in a loop -- Direct3D's fence hold waiting for the
+ * push-buffer executor, the executor between passes, the APU frame thread -- then waits
+ * behind every runnable thread on the machine, whatever its QoS, and on a busy host (an
+ * 8-core Mac with a browser and the system's daemons) both halves of a frame starved
+ * together: a Story scene's frame lasted 100-300 ms while the game and the executor ran
+ * for 3 and 8 ms of a 54 ms probe window. thread_switch() with no option yields the CPU
+ * to a thread that is ready at the caller's priority and keeps that priority.
+ * RECOMP_YIELD_DEPRESS=1 restores sched_yield(). Elsewhere sched_yield() does not depress. */
+static void host_yield(void)
+{
+#if defined(__APPLE__)
+    static int depress = -1;
+    if (depress < 0) {
+        const char *e = getenv("RECOMP_YIELD_DEPRESS");
+        depress = e && *e == '1';
+    }
+    if (!depress) {
+        thread_switch(MACH_PORT_NULL, SWITCH_OPTION_NONE, 0);
+        return;
+    }
+#endif
+    sched_yield();
+}
+
+VOID SwitchToThread(void) { gc_yield(); host_yield(); }
 
 DWORD QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data)
 {
@@ -1246,7 +1805,7 @@ static int precise_sleep_wanted(void)
 
 VOID Sleep(DWORD ms)
 {
-    if (ms == 0) { gc_yield(); sched_yield(); return; }
+    if (ms == 0) { gc_yield(); host_yield(); return; }
     struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
     int blocked = gc_block();
     if (precise_sleep_wanted()) {
@@ -1268,7 +1827,7 @@ VOID Sleep(DWORD ms)
             if (left <= 0)
                 break;
             if (left <= 200000) {
-                sched_yield();
+                host_yield();
                 continue;
             }
             left = left > 800000 ? left * 3 / 4 : left - 200000;
@@ -2166,6 +2725,22 @@ int view_lookup(const void *addr, void **base_out, size_t *len_out)
     return found;
 }
 
+/* Start of the lowest registered view above addr, or 0 when there is none.
+ * VirtualQuery's answer for memory the shim does not own: the free run it
+ * reports ends where the next mapping it knows of begins. */
+static uintptr_t view_next_above(const void *addr)
+{
+    uintptr_t next = 0;
+    pthread_mutex_lock(&s_views_lock);
+    for (int i = 0; i < 512; i++) {
+        uintptr_t lo = (uintptr_t)s_views[i].addr;
+        if (lo > (uintptr_t)addr && (!next || lo < next))
+            next = lo;
+    }
+    pthread_mutex_unlock(&s_views_lock);
+    return next;
+}
+
 size_t view_take(const void *addr)
 {
     size_t len = 0;
@@ -2182,10 +2757,12 @@ static int anon_map_fd(const char *name)
 {
 #if defined(__APPLE__)
     static volatile LONG map_counter = 0;
+    /* The pid keeps two instances apart: with a bare counter, both open
+     * "/xbox_map_1" and the second O_EXCL loses. macOS caps the name at 31. */
     char shm_name[32];
     LONG seq = InterlockedIncrement(&map_counter);
     const char *base = name ? name : "xbox_map";
-    snprintf(shm_name, sizeof(shm_name), "/%s_%ld", base, seq);
+    snprintf(shm_name, sizeof(shm_name), "/%.12s_%d_%ld", base, (int)getpid(), (long)seq);
     int fd = shm_open(shm_name, O_CREAT | O_RDWR | O_EXCL, 0600);
     if (fd >= 0) shm_unlink(shm_name);
     return fd;
@@ -2232,6 +2809,7 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
     SIZE_T len = count ? count : (o->map_size - (SIZE_T)off);
     int prot   = PROT_READ | ((access != FILE_MAP_READ) ? PROT_WRITE : 0);
     int flags  = MAP_SHARED;
+    int placeholder = 0;
     int arena  = baseAddr ? arena_state(baseAddr, len) : ARENA_OUTSIDE;
 
     if (arena == ARENA_LIVE || arena == ARENA_MIXED) {
@@ -2259,6 +2837,7 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
             SetLastError(ERROR_INVALID_ADDRESS);
             return NULL;
         }
+        placeholder = 1;
         flags |= MAP_FIXED;
 #else
         flags |= MAP_FIXED;
@@ -2266,7 +2845,14 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
     }
 
     void *p = mmap(baseAddr, len, prot, flags, o->fd, off);
-    if (p == MAP_FAILED) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
+    if (p == MAP_FAILED) {
+        /* A failed MAP_FIXED leaves the placeholder where it was. Nothing has
+         * registered it, so UnmapViewOfFile could never free it, and every
+         * later attempt at this address would be refused as occupied. */
+        if (placeholder) munmap(baseAddr, len);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
     if (baseAddr && p != baseAddr) {
         /* MAP_FIXED_NOREPLACE hands back a different address instead of
          * failing on some kernels; treat that as the refusal it means. */
@@ -2327,10 +2913,21 @@ SIZE_T VirtualQuery(LPCVOID address, PMEMORY_BASIC_INFORMATION buffer, SIZE_T le
     size_t len  = 0;
 
     if (!view_lookup(address, &base, &len)) {
-        /* Not ours. Report it free rather than inventing a committed page. */
+        /* Not ours. Report it free rather than inventing a committed page,
+         * up to the next mapping the shim knows of (or the end of the address
+         * space). Win32 callers walk free memory region by region; a size of
+         * 0 never moved them on (guest_vmem's free-run scan spun forever).
+         * Mappings made outside the shim are invisible here, so a caller that
+         * then reserves at a fixed address can still be refused. */
+        uintptr_t next = view_next_above(address);
+        uintptr_t a    = (uintptr_t)address;
         buffer->BaseAddress    = (PVOID)address;
         buffer->AllocationBase = NULL;
-        buffer->RegionSize     = 0;
+        /* At address 0 the span to the top is UINTPTR_MAX + 1, which wraps
+         * to 0; report UINTPTR_MAX so the walk still moves on. */
+        buffer->RegionSize     = next ? next - a
+                               : a    ? UINTPTR_MAX - a + 1
+                                      : UINTPTR_MAX;
         buffer->State          = MEM_FREE;
         buffer->Protect        = PAGE_NOACCESS;
         buffer->Type           = 0;

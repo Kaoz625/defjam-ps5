@@ -63,8 +63,15 @@ UINT d3d8_present_render_scale(void);     /* 0 = no host override */
 void d3d8_present_canvas_aspect(UINT *num, UINT *den); /* 0, 0 = the title's own shape */
 int  d3d8_present_sync_interval(void);    /* -1 = no host choice; else Present's interval */
 void d3d8_present_trace_pacing(void);     /* RECOMP_PRESENT_PACING=1 */
+void d3d8_present_trace_display(void *swap_chain);  /* the same: time on screen per frame */
+void d3d8_present_note_block(double ms);            /* how long the last Present call took */
 HRESULT d3d8_present_create_game_target(UINT width, UINT height, ID3D11RenderTargetView **rtv);
 ID3D11Texture2D *d3d8_present_game_texture(void);
+/* MSAA ([display] msaa): the target's sample count (1: off), and the resolve of
+ * the multisampled target into the game texture. Returns the view to use for
+ * the gamma pass: `drawn` without MSAA, the game texture's own with it. */
+UINT d3d8_present_msaa(void);
+ID3D11RenderTargetView *d3d8_present_resolve(ID3D11RenderTargetView *drawn);
 HRESULT d3d8_present_blit(void);
 void d3d8_present_shutdown(void);
 
@@ -161,13 +168,13 @@ typedef struct D3D8Surface {
     BOOL                    locked;
     BOOL                    lock_readonly;
 
-    /* P8 (palettized) surfaces: raw index data lives in the parent
-     * texture's sys_mem. LockRect returns the indices directly instead
-     * of the palette-expanded BGRA that the D3D11 texture holds. */
+    /* CPU-backed surfaces: P8 indices or decoded DXT blocks retain their
+     * guest representation instead of exposing the host's BGRA pixels. */
     BOOL                    palettized;
-    const BYTE             *palette_sys;  /* raw level data (1 byte/texel) */
+    const BYTE             *palette_sys;  /* raw guest level data */
     UINT                    palette_pitch;
     UINT                    palette_index; /* stage palette baked into it */
+    IDirect3DTexture8      *shadow_parent; /* keeps a 2D texture's CPU data alive */
 } D3D8Surface;
 
 /* 2D texture (D3D11 Texture2D). See tex_* implementation.

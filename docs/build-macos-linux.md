@@ -12,7 +12,7 @@ same pipeline off Windows, since v0.5.0.
 |---|---|
 | macOS on Apple Silicon (arm64) | Playable. Built, regression-tested and play-tested on macOS 26 with a DualSense. |
 | macOS on Intel | Not tried. |
-| Linux x86-64 | Builds and runs natively (D95). Built with Clang 20 and run on a Steam Deck; 12 of the 14 regression checks pass on the Deck; combat and versus fail only on a few audio-queue underruns ([#11](https://github.com/vyanhursky/DefJamFFNY-recomp/issues/11)). Play-tested by the owner on the Deck. |
+| Linux x86-64 | Native Vulkan build; Steam Deck is the Linux product acceptance target. See the versioned release notes for exact regression results and qualifications. |
 | Steam Deck | Native, through Vulkan on the Deck's GPU, with PipeWire sound and the Deck's own controls as a pad. SteamOS has no compiler: build in a container (below) and run the game on SteamOS itself. Proton not tried. |
 
 What is different from Windows:
@@ -85,29 +85,57 @@ RUN echo 'Server = https://archive.archlinux.org/repos/2025/07/27/$repo/os/$arch
  && pacman -Syy --noconfirm --needed cmake ninja clang pkgconf sdl3 shaderc vulkan-headers \
         vulkan-icd-loader openssl python git \
  && sed -i '/^faked-system-time/d' /etc/pacman.d/gnupg/gpg.conf && pacman -Scc --noconfirm \
- && python -m venv /opt/djpy && /opt/djpy/bin/pip install -q pyxbe capstone pytest
+ && python -m venv /opt/djpy && /opt/djpy/bin/pip install -q pyxbe capstone pytest numpy
 ENV CC=clang CXX=clang++
 EOF
 podman build -t localhost/defjam-dev .
-alias djc='podman run --rm -it --userns=keep-id --security-opt label=disable -v "$HOME:$HOME" -w "$PWD" -e DEFJAM_DATA localhost/defjam-dev'
+alias djc='podman run --rm --init -it --userns=keep-id --security-opt label=disable -v "$HOME:$HOME" -w "$PWD" -e DEFJAM_DATA localhost/defjam-dev'
 alias djpy='djc /opt/djpy/bin/python'   # instead of the uv alias below
 ```
 
 The `faked-system-time` line lets pacman check the archive's signatures as of
 that date: some packagers' keys have expired since. The container sees your
 home folder at the same path, so the repository and the data folder are the
-same inside and out. Use this `djpy` for the pipeline steps below (and `djc` in
-front of any other build command), and start the game itself on SteamOS, from a
-Desktop Mode terminal:
+same inside and out. Use this `djpy` for all three pipeline steps below,
+analyze, recomp and build (and `djc` in front of any other build command), and
+start the game itself on SteamOS, from a Desktop Mode terminal. The analysis
+records the Python and the `pyxbe`/`capstone` versions it ran with, and recomp
+and build refuse analysis from another interpreter ("Analysis is stale
+(interpreter changed)"): analyzing in a SteamOS venv and building in the
+container does not work. The harness on SteamOS checks the finished build
+against the interpreter the analysis recorded, so it may run on another Python.
 `ldd -r build/posix-release/defjam_recomp` there lists anything the build
 needs that SteamOS lacks.
 
-Python 3.12 or newer with `pyxbe`, `capstone` and `pytest`. With
+`--init` matters: without it the setup engine's process-tree test
+(`tests/unit/test_setup_engine.py`) fails, because the container's first process
+does not reap children. The image has no SDL2, so a native fixture that builds the
+audio library on its own (`memory_layout_posix`, `kernel_memory_posix`,
+`kernel_path_posix`, `kernel_bridge`) needs `-DXBOXRECOMP_SDL3=ON` on its
+`cmake -S` line, as the game build has.
+
+The scripted regression (`scripts/regress.py`) runs on SteamOS itself, not in the container, from a
+venv that has `pytest`, `numpy`, `pillow`, `pyxbe` and `capstone`. A SteamOS update can move the system
+Python on, and a venv made from the old one then loses its packages (`No module named 'capstone'`):
+make the venv again. Start it in `gamescope --backend
+headless`, which needs no screen and runs the whole table in one go (40 minutes):
+
+```bash
+export DEFJAM_DATA=~/Games/DefJamRecompiled/Data
+gamescope --backend headless -W 1280 -H 800 -r 90 -- ~/djvenv/bin/python -B scripts/regress.py --preset posix-release
+```
+
+Plain `gamescope` (nested in the desktop session) aborts on a second game launch, which kills the
+harness. A run killed that way leaves the save changed: the next run refuses to start, and
+`python scripts/harness.py save-recover` shows the copy to restore (`--restore`) or keep (`--accept`).
+
+Python 3.12 or newer with `pyxbe`, `capstone` and `pytest`; the unit tests and the audio scripts also
+need `numpy`, `pillow` and `cryptography` (the mod manager). With
 [uv](https://docs.astral.sh/uv/) (`brew install uv`) nothing else has to be
 installed; the rest of this page uses this alias:
 
 ```bash
-alias djpy='uv run --no-project --with pyxbe --with capstone --with pytest python'
+alias djpy='uv run --no-project --with pyxbe --with capstone --with pytest --with numpy --with pillow --with cryptography python'
 ```
 
 ## Data folder
@@ -157,9 +185,9 @@ The redirection keeps a log of the session; the game prints a great deal, and
 `logs/play-*.log.err` is what a problem report needs. Plain
 `./build/posix-release/defjam_recomp` works too.
 
-- The game finds `game` in the repository root, and writes `settings.ini` and
-  the saves under `DEFJAM_DATA` (`save/`). The first lines of the log say which
-  folders were used.
+- The game finds `game` in the repository root, and writes `settings.ini`, the
+  saves (`save/`) and its shader cache (`cache/vulkan/`) under `DEFJAM_DATA`. The
+  first lines of the log say which folders were used.
 - Gamepads (Xbox, DualSense, Switch Pro and most others) work when plugged in
   or paired, before or after the game starts. The keyboard and mouse are a
   player of their own. Defaults and remapping:
@@ -173,8 +201,7 @@ The redirection keeps a log of the session; the game prints a great deal, and
 
 ## Known limits
 
-- The window follows the display's pixel density (2560x1920 pixels for the default 1280x960 window on a Retina
-  display, as `[HOST] window ...` in the log says), and the overlay is drawn at that resolution. Window width and
+- The window follows the display's pixel density (for example, a2×backing scale gives3840x2160pixels for a1920x1080logical window; check `[HOST] window ...` for the actual drawable size), and the overlay is drawn at that resolution. Window width and
   height changed in the overlay resize the window at once.
 - HD textures work through the same `[textures]` settings as on Windows (macOS since
   v0.6.1, Linux since v0.7.2; [guide](hd-textures.md)); the packs are made by the macOS
@@ -183,8 +210,11 @@ The redirection keeps a log of the session; the game prints a great deal, and
   replacement is decoded on background threads and the original texture is drawn until it is
   ready, so the first showing of a screen no longer stalls the game; the art arrives a moment
   after the screen does.
-- No persistent shader cache: the first time an effect appears, the frame can
-  hitch while its shader is compiled.
+- Shaders are compiled the first time an effect appears, and that frame can hitch.
+  The compiled shaders and the graphics driver's pipeline cache are kept in
+  `DEFJAM_DATA/cache/vulkan`, so this happens once per effect, not once per launch.
+  Deleting that folder is safe (it is rebuilt); `RECOMP_SHADER_CACHE=off` runs
+  without it.
 - Vsync (`settings.ini` `vsync`) is only used on a display refreshing at a
   multiple of 60 Hz, as on Windows; elsewhere the game paces itself. The Steam
   Deck OLED's panel runs at 90 Hz, so it plays without vsync there; the log's
@@ -193,7 +223,7 @@ The redirection keeps a log of the session; the game prints a great deal, and
   single core, so game threads take turns instead. A thread that has just woken
   can wait a few milliseconds for its turn. `RECOMP_GUEST_CORES=all` turns the
   rule off for diagnosis; the game can then freeze, typically at a movie.
-- See also [known issues](known-issues.md), which apply to every host.
+- See also [GitHub Issues](https://github.com/vyanhursky/DefJamFFNY-recomp/issues), which apply to every host.
 
 ## If something goes wrong
 
@@ -207,10 +237,10 @@ The redirection keeps a log of the session; the game prints a great deal, and
   a `[D3D8-VK]` line near the top of the log names the device it found.
 - The game stops responding but sound continues: keep the log, and if you can,
   take the thread stacks before quitting with
-  `sample $(pgrep -f posix-release/defjam_recomp) 3 -file logs/sample.txt` on macOS,
-  or `gdb -p $(pgrep -x defjam_recomp) -batch -ex "thread apply all bt 12" > logs/stacks.txt`
-  on Linux (as root, or with `kernel.yama.ptrace_scope` at 0). The hang tools in
-  `scripts/` (`sample-threads.py`, `guest-stack.py`, `native-stacks.py`) are
+  `python3 scripts/native-stacks.py > logs/stacks.txt` (lldb on macOS; gdb or
+  elfutils' `eu-stack` on Linux, as root or with `kernel.yama.ptrace_scope` at 0).
+  `sample $(pgrep -x defjam_recomp) 3 -file logs/sample.txt` also works on macOS. The
+  other hang tools in `scripts/` (`sample-threads.py`, `guest-stack.py`) are
   Windows-only.
 - No sound: the log has an `[XA2]` line naming the audio driver and device.
 

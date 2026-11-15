@@ -31,7 +31,11 @@
 
 /* Bring the models up. Safe to call more than once; does nothing unless
  * RECOMP_USB is set, so a title that was working without a controller keeps
- * behaving exactly as it did. */
+ * behaving exactly as it did. Call it after the guest memory is mapped.
+ *
+ * The registers are trapped on Windows x86-64 and on POSIX arm64 hosts. On
+ * any other host the model stays off, with a one-line notice, and the title
+ * sees the aperture as plain memory, as it does with RECOMP_USB unset. */
 void xbox_OhciInit(void);
 
 /* Make sure the hub has at least `n` controllers (1-4). Raising the count at run
@@ -44,7 +48,11 @@ void xbox_UsbSetPadCount(int n);
 int  xbox_OhciOwnsAddress(uint32_t xbox_va);
 
 /* Service a trapped access. Returns 1 if the faulting instruction was decoded
- * and stepped over. `ctx` is a PCONTEXT; void * keeps windows.h out of here. */
+ * and stepped over. `ctx` is the fault's thread state: the PCONTEXT from a
+ * Win32 VEH, or the ucontext_t * a POSIX SA_SIGINFO handler receives (its
+ * third argument). void * keeps windows.h out of here. A title's fault
+ * handler calls this (or xbox_VehMmioFault / xbox_PosixMmioFault, which
+ * route to it) before it treats the fault as a crash. */
 int  xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va);
 
 /* Report counts at exit, so a run says whether the driver ever looked. */

@@ -21,7 +21,8 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 PYTHON_VERSION = '3.13.5'
-PACKAGES = ['pyxbe==1.0.4', 'capstone==5.0.9', 'Pillow==12.3.0', 'numpy==2.5.2']
+PACKAGES = ['pyxbe==1.0.4', 'capstone==5.0.9', 'Pillow==12.3.0', 'numpy==2.5.2', 'cryptography==50.0.2', 'cffi==2.0.0', 'pycparser==2.23']
+MOD_SOURCES = ('setup/mods.py', 'setup/mod_catalogue.py', 'config/mods/catalogue-keys.json')
 HD_SOURCES = ('scripts/build-hd-pack.py', 'scripts/hd_assets.py',
               'scripts/hd_corpus.py', 'scripts/hd_corpus.html',
               'config/hd-runtime-aliases.json')
@@ -57,10 +58,13 @@ def source_allowed(name, toolkit=False):
 
 # The part of branding/ each platform's setup uses at install time: the Windows game build embeds the
 # .ico, the POSIX game build the window icon, and the Linux setup also installs the 256 px icon, shows
-# the 128 px one in its wizard and places the Steam artwork. The rest (masters, macOS icons, previews)
+# the 128 px one in its wizard and places the Steam artwork, as the Windows app does. The rest (masters, macOS icons, previews)
 # is for the repository, and a payload that carried it would be megabytes larger.
 BRANDING_FOR = {
-    'windows-x64': ('branding/icon/defjam.ico',),
+    # The Windows app adds itself to Steam (setup/steam_shortcuts.py): the five images it places, not the
+    # plain portrait, wide and logo, which the fan set replaces.
+    'windows-x64': ('branding/icon/defjam.ico', 'branding/fan/steam/portrait.png', 'branding/fan/steam/wide.png',
+                    'branding/fan/steam/logo.png', 'branding/steam/hero.png', 'branding/steam/icon.png'),
     'macos-arm64': ('branding/icon/window/window-128-macos.rgba',),
     'linux-x64': ('branding/icon/window/window-128.rgba', 'branding/icon/png/defjam-128.png',
                   'branding/icon/png/defjam-256.png', 'branding/steam/', 'branding/fan/steam/'),
@@ -194,7 +198,8 @@ def stage_linux(args, staging, source, toolkit):
 def stage_windows(args, staging, source, toolkit):
     """Embedded Python, wheels, offline SDL3/ImGui source and the native launcher."""
     (staging / 'engine').mkdir()
-    for name in ('engine.py', 'releases.py', 'transaction.py', 'install-prerequisites.ps1', 'shortcuts.ps1'):
+    for name in ('engine.py', 'releases.py', 'transaction.py', 'steam_shortcuts.py', 'install-prerequisites.ps1',
+                 'shortcuts.ps1'):
         shutil.copyfile(ROOT / 'setup' / name, staging / 'engine' / name)
     shutil.copyfile(args.launcher, staging / 'DefJamLauncher.exe')
     provenance = []
@@ -258,7 +263,7 @@ def main(argv=None):
         source.mkdir()
         copy_sources(ROOT, source, platform=args.platform)
         copy_sources(toolkit, source / 'tools/xboxrecomp', True)
-        for name in HD_SOURCES:
+        for name in HD_SOURCES + MOD_SOURCES:
             if not (source / name).is_file():
                 raise ValueError('Required HD setup source is not tracked: ' + name)
         # Source archives contain no Git metadata and never receive the user's bytes.

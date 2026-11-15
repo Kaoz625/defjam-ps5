@@ -8,6 +8,7 @@ if(WIN32)
         d3d8_formats.c
         d3d8_gamma.c
         d3d8_present.c
+        d3d8_readback.c
         d3d8_resources.c
         d3d8_shaders.c
         d3d8_states.c
@@ -46,6 +47,7 @@ else()
     if(XBOXRECOMP_VULKAN AND Vulkan_FOUND AND SHADERC_FOUND)
         add_library(xbox_d3d8 STATIC
             d3d8_vk.c
+            d3d8_vk_cache.c
             d3d8_formats.c
             d3d8_combiners.c
         )

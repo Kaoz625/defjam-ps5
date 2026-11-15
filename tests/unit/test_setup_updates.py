@@ -1,10 +1,12 @@
 """Game-free updater policy, network/archive integrity and native crash recovery."""
 import argparse
+import contextlib
 import importlib.util
 import io
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import zipfile
@@ -228,6 +230,7 @@ def test_installed_dump_without_original_is_verified_and_clean_candidate_is_uniq
 
 def test_recovery_before_receipt_requirements_needs_no_original_dump(tmp_path, monkeypatch):
     from test_setup_engine import installer
+    monkeypatch.setattr(engine.releases, "default_cache", lambda: tmp_path / "cache/releases")
     obj=installer(tmp_path);obj.extract()
     receipt=dict(schema=1,version='0.4.1',source=str(obj.source),data=str(obj.data),executable=str(obj.source/'fake'))
     engine.write_json(obj.install/'installed.json',receipt)
@@ -252,29 +255,124 @@ def test_failure_during_recovery_can_be_retried_without_losing_backup(tmp_path, 
     assert target.read_text()=='old'
 
 
-def test_cancelled_handoff_lets_child_clean_separate_stage_session(tmp_path):
-    import time
+@pytest.mark.parametrize('name', ['DefJamLauncher.exe', 'Def Jam Recompiled', 'installed.json'])
+def test_recovery_skips_unchanged_targets_but_restores_changed_receipts(tmp_path, monkeypatch, name):
+    root = tmp_path / 'app'; data = tmp_path / 'data'; root.mkdir(); data.mkdir()
+    launcher = root / name
+    receipt = root / 'installed.ini'
+    launcher.write_bytes(b'old launcher')
+    receipt.write_bytes(b'old receipt')
+    tx = transaction.Activation(root, data)
+    tx.begin([launcher, receipt])
+    receipt.write_bytes(b'new receipt')
+    replace = transaction.os.replace
+    def deny_unchanged(src, dst):
+        assert Path(dst) != launcher, 'recovery tried replacing an unchanged target'
+        return replace(src, dst)
+    monkeypatch.setattr(transaction.os, 'replace', deny_unchanged)
+    tx.recover(); tx.recover()
+    assert launcher.read_bytes() == b'old launcher'
+    assert receipt.read_bytes() == b'old receipt'
+    assert not tx.folder.exists()
+
+
+def test_recovery_skips_unchanged_macos_bundle(tmp_path, monkeypatch):
+    root = tmp_path / 'app'; data = tmp_path / 'data'; root.mkdir(); data.mkdir()
+    bundle = root / 'Def Jam Recompiled.app'
+    (bundle / 'Contents/MacOS').mkdir(parents=True)
+    (bundle / 'Contents/MacOS/DefJamLauncher').write_bytes(b'synthetic launcher')
+    tx = transaction.Activation(root, data); tx.begin([bundle])
+    monkeypatch.setattr(transaction, 'copy', lambda *a: pytest.fail('unchanged bundle copied'))
+    tx.recover(); tx.recover()
+    assert not tx.folder.exists()
+
+
+def test_activation_reports_original_and_recovery_failures(tmp_path, monkeypatch):
+    from test_setup_engine import installer
+    obj = installer(tmp_path)
+    monkeypatch.setattr(engine, 'IS_WINDOWS', True)
+    monkeypatch.setattr(engine, 'check_launcher_closed', lambda root: None)
+    monkeypatch.setattr(engine.transaction.Activation, 'begin', lambda *a: None)
+    def blocked(*a):
+        raise PermissionError('launcher promotion blocked')
+    def recovery(*a):
+        raise PermissionError('backup restore blocked')
+    monkeypatch.setattr(engine.shutil, 'copyfile', blocked)
+    monkeypatch.setattr(engine.transaction.Activation, 'recover', recovery)
+    with pytest.raises(engine.SetupError, match='launcher promotion blocked.*recovery also failed.*backup restore blocked') as error:
+        engine.Engine.activate(obj)
+    assert isinstance(error.value.__cause__, PermissionError)
+
+
+def test_launcher_preflight_precedes_pending_recovery(tmp_path, monkeypatch):
+    from test_setup_engine import installer
+    obj = installer(tmp_path)
+    target = obj.install / 'installed.json'
+    target.write_text('old')
+    tx = engine.transaction.Activation(obj.install, obj.data); tx.begin([target])
+    target.write_text('pending')
+    monkeypatch.setattr(engine.releases, 'default_cache', lambda: tmp_path / 'cache/releases')
+    def busy(root):
+        raise engine.SetupError('Close DefJamLauncher.exe', 5)
+    monkeypatch.setattr(engine, 'check_launcher_closed', busy)
+    code = engine.main(['--payload', str(obj.payload), '--install-dir', str(obj.install),
+                        '--data-dir', str(obj.data), '--operation', 'repair', '--bundled-only'])
+    assert code == 5
+    assert target.read_text() == 'pending' and tx.folder.exists()
+
+
+@pytest.fixture
+def handoff_children(monkeypatch):
+    """Record run_selected's engine children and stop any that a failing test leaves running."""
+    started = []
+    original = releases.start_selected
+    def start(*args):
+        child, job = original(*args)
+        started.append(child)
+        return child, job
+    monkeypatch.setattr(releases, 'start_selected', start)
+    yield started
+    for child in started:
+        if child.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(child.pid, signal.SIGKILL)
+            child.wait()
+
+
+@pytest.mark.parametrize('ps_denied', [False, True], ids=['ps', 'ps-denied'])
+def test_cancelled_handoff_lets_child_clean_separate_stage_session(tmp_path, monkeypatch, handoff_children, ps_denied):
     folder=tmp_path/'payload';(folder/'engine').mkdir(parents=True);(folder/'python/bin').mkdir(parents=True)
     interpreter=folder/'python/bin/python3'
     if os.name=='nt':pytest.skip('POSIX separate sessions; Windows taskkill exercised by native CI')
     interpreter.symlink_to(sys.executable)
     (folder/'manifest.json').write_text(json.dumps({'updater':releases.CONTRACT}))
     cancel=tmp_path/'cancel';ready=tmp_path/'ready';done=tmp_path/'done'
+    # Like the real engine, the stand-in gives up when its handoff parent is gone, and its stage
+    # when the engine is gone, so not even a killed pytest leaves either running.
     (folder/'engine/engine.py').write_text('''import subprocess,sys,time,os,signal
 from pathlib import Path
 args=sys.argv
 cancel=Path(args[args.index('--cancel-file')+1]);root=Path(args[args.index('--install-dir')+1])
-stage=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'],start_new_session=True)
+parent=int(args[args.index('--handoff-parent')+1])
+stage=subprocess.Popen([sys.executable,'-c','import os,time\\np=os.getppid();end=time.time()+60\\nwhile os.getppid()==p and time.time()<end:time.sleep(.05)'],start_new_session=True)
 (root/'ready').write_text(str(stage.pid))
-while not cancel.exists():time.sleep(.02)
+while not cancel.exists() and os.getppid()==parent:time.sleep(.02)
 os.killpg(stage.pid,signal.SIGTERM);stage.wait();(root/'done').write_text('cleaned');sys.exit(6)
 ''')
+    if ps_denied:
+        # Some sandboxes (Codex on macOS) refuse to start ps; the handoff must still cancel cleanly.
+        real_run=subprocess.run
+        def run(argv,*a,**k):
+            if argv[0]=='ps':raise PermissionError(1,'Operation not permitted','ps')
+            return real_run(argv,*a,**k)
+        monkeypatch.setattr(releases.subprocess,'run',run)
     args=argparse.Namespace(install_dir=str(tmp_path),data_dir=None,dump=None,operation='update',toolchain=None,
                            log=None,status_file=None,cancel_file=str(cancel))
     def cancelled():
         if ready.exists():cancel.touch();raise ValueError('cancelled')
     with pytest.raises(ValueError):releases.run_selected(args,'macos-arm64',folder,cancelled)
     assert done.read_text()=='cleaned'
+    assert [child.poll() for child in handoff_children]==[6]
     with pytest.raises(ProcessLookupError):os.kill(int(ready.read_text()),0)
 
 

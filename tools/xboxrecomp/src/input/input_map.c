@@ -19,61 +19,75 @@ static const char *const k_control_names[INPUT_CONTROL_COUNT] = {
     "right_stick_up", "right_stick_down", "right_stick_left", "right_stick_right",
 };
 
-const char *input_control_name(int control)
+const char *xbox_InputMap_ControlName(int control)
 {
     return control >= 0 && control < INPUT_CONTROL_COUNT ? k_control_names[control] : NULL;
 }
 
+static int ascii_lower(int c) { return c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c; }
+static int ascii_upper(int c) { return c >= 'a' && c <= 'z' ? c - ('a' - 'A') : c; }
+
 static int equal_nocase(const char *a, const char *b)
 {
     for (; *a && *b; a++, b++)
-        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return 0;
+        if (ascii_lower((unsigned char)*a) != ascii_lower((unsigned char)*b)) return 0;
     return *a == *b;
+}
+
+int xbox_InputMap_ControlFromName(const char *name)
+{
+    int i;
+    if (!name) return -1;
+    for (i = 0; i < INPUT_CONTROL_COUNT; i++)
+        if (equal_nocase(name, k_control_names[i])) return i;
+    return -1;
 }
 
 /* ---- merging ------------------------------------------------------------- */
 
-static long stick_mag2(int x, int y) { return (long)x * x + (long)y * y; }
+static int64_t stick_mag2(int x, int y) { return (int64_t)x * x + (int64_t)y * y; }
 
-void input_pad_merge(InputPad *dst, const InputPad *src)
+void xbox_InputMap_PadMerge(XBOX_GAMEPAD *dst, const XBOX_GAMEPAD *src)
 {
     int i;
-    dst->buttons |= src->buttons;
+    dst->wButtons |= src->wButtons;
     for (i = 0; i < 8; i++)
-        if (src->analog[i] > dst->analog[i]) dst->analog[i] = src->analog[i];
-    if (stick_mag2(src->lx, src->ly) > stick_mag2(dst->lx, dst->ly)) {
-        dst->lx = src->lx; dst->ly = src->ly;
+        if (src->bAnalogButtons[i] > dst->bAnalogButtons[i])
+            dst->bAnalogButtons[i] = src->bAnalogButtons[i];
+    if (stick_mag2(src->sThumbLX, src->sThumbLY) > stick_mag2(dst->sThumbLX, dst->sThumbLY)) {
+        dst->sThumbLX = src->sThumbLX; dst->sThumbLY = src->sThumbLY;
     }
-    if (stick_mag2(src->rx, src->ry) > stick_mag2(dst->rx, dst->ry)) {
-        dst->rx = src->rx; dst->ry = src->ry;
+    if (stick_mag2(src->sThumbRX, src->sThumbRY) > stick_mag2(dst->sThumbRX, dst->sThumbRY)) {
+        dst->sThumbRX = src->sThumbRX; dst->sThumbRY = src->sThumbRY;
     }
 }
 
 /* ---- keys ---------------------------------------------------------------- */
 
-typedef struct KeyName { const char *name; int code; } KeyName;
+typedef struct KeyName { const char *name; int vk; } KeyName;
 
 /* The first name listed for a code is the one written back. Letters, digits,
- * function keys and the numeric pad's digits are generated rather than listed. */
+ * function keys and the numeric pad's digits are generated rather than listed.
+ * The mouse wheel has no virtual-key code, so it has no name here. */
 static const KeyName k_keys[] = {
-    { "mouse1", 0x01 }, { "mouse2", 0x02 }, { "mouse3", 0x04 },
-    { "mouse4", 0x05 }, { "mouse5", 0x06 },
-    { "wheelup", INPUT_KEY_WHEEL_UP }, { "wheeldown", INPUT_KEY_WHEEL_DOWN },
-    { "backspace", 0x08 }, { "tab", 0x09 }, { "enter", 0x0D }, { "return", 0x0D },
-    { "shift", 0x10 }, { "ctrl", 0x11 }, { "control", 0x11 }, { "alt", 0x12 },
-    { "pause", 0x13 }, { "capslock", 0x14 },
-    { "escape", 0x1B }, { "esc", 0x1B }, { "space", 0x20 },
-    { "pageup", 0x21 }, { "pagedown", 0x22 }, { "end", 0x23 }, { "home", 0x24 },
-    { "left", 0x25 }, { "up", 0x26 }, { "right", 0x27 }, { "down", 0x28 },
-    { "insert", 0x2D }, { "delete", 0x2E },
-    { "numpadmultiply", 0x6A }, { "numpadadd", 0x6B }, { "numpadsubtract", 0x6D },
-    { "numpaddecimal", 0x6E }, { "numpaddivide", 0x6F },
-    { "lshift", 0xA0 }, { "rshift", 0xA1 }, { "lctrl", 0xA2 }, { "rctrl", 0xA3 },
-    { "lalt", 0xA4 }, { "ralt", 0xA5 },
-    { "semicolon", 0xBA }, { "equals", 0xBB }, { "comma", 0xBC }, { "minus", 0xBD },
-    { "period", 0xBE }, { "slash", 0xBF }, { "grave", 0xC0 },
-    { "leftbracket", 0xDB }, { "backslash", 0xDC }, { "rightbracket", 0xDD },
-    { "quote", 0xDE },
+    { "mouse1", XBOX_VK_LBUTTON }, { "mouse2", XBOX_VK_RBUTTON }, { "mouse3", XBOX_VK_MBUTTON },
+    { "mouse4", XBOX_VK_XBUTTON1 }, { "mouse5", XBOX_VK_XBUTTON2 },
+    { "backspace", XBOX_VK_BACK }, { "tab", XBOX_VK_TAB }, { "enter", XBOX_VK_RETURN }, { "return", XBOX_VK_RETURN },
+    { "shift", XBOX_VK_SHIFT }, { "ctrl", XBOX_VK_CONTROL }, { "control", XBOX_VK_CONTROL }, { "alt", XBOX_VK_MENU },
+    { "pause", XBOX_VK_PAUSE }, { "capslock", XBOX_VK_CAPITAL },
+    { "escape", XBOX_VK_ESCAPE }, { "esc", XBOX_VK_ESCAPE }, { "space", XBOX_VK_SPACE },
+    { "pageup", XBOX_VK_PRIOR }, { "pagedown", XBOX_VK_NEXT }, { "end", XBOX_VK_END }, { "home", XBOX_VK_HOME },
+    { "left", XBOX_VK_LEFT }, { "up", XBOX_VK_UP }, { "right", XBOX_VK_RIGHT }, { "down", XBOX_VK_DOWN },
+    { "insert", XBOX_VK_INSERT }, { "delete", XBOX_VK_DELETE },
+    { "numpadmultiply", XBOX_VK_MULTIPLY }, { "numpadadd", XBOX_VK_ADD }, { "numpadsubtract", XBOX_VK_SUBTRACT },
+    { "numpaddecimal", XBOX_VK_DECIMAL }, { "numpaddivide", XBOX_VK_DIVIDE },
+    { "lshift", XBOX_VK_LSHIFT }, { "rshift", XBOX_VK_RSHIFT }, { "lctrl", XBOX_VK_LCONTROL }, { "rctrl", XBOX_VK_RCONTROL },
+    { "lalt", XBOX_VK_LMENU }, { "ralt", XBOX_VK_RMENU },
+    { "semicolon", XBOX_VK_OEM_1 }, { "equals", XBOX_VK_OEM_PLUS }, { "comma", XBOX_VK_OEM_COMMA }, { "minus", XBOX_VK_OEM_MINUS },
+    { "period", XBOX_VK_OEM_PERIOD }, { "slash", XBOX_VK_OEM_2 }, { "grave", XBOX_VK_OEM_3 },
+    { "leftbracket", XBOX_VK_OEM_4 }, { "backslash", XBOX_VK_OEM_5 }, { "rightbracket", XBOX_VK_OEM_6 },
+    { "quote", XBOX_VK_OEM_7 },
+    { "wheelup", XBOX_VK_WHEEL_UP }, { "wheeldown", XBOX_VK_WHEEL_DOWN },   /* Def Jam fork */
 };
 #define KEY_TABLE_COUNT ((int)(sizeof(k_keys) / sizeof(k_keys[0])))
 
@@ -87,7 +101,7 @@ static int numbered(const char *name, const char *prefix, int lo, int hi)
     {
         size_t i;
         for (i = 0; i < n; i++)
-            if (tolower((unsigned char)name[i]) != prefix[i]) return -1;
+            if (ascii_lower((unsigned char)name[i]) != prefix[i]) return -1;
     }
     v = atoi(name + n);
     snprintf(tail, sizeof(tail), "%d", v);
@@ -95,87 +109,90 @@ static int numbered(const char *name, const char *prefix, int lo, int hi)
     return v;
 }
 
-int input_key_from_name(const char *name)
+int xbox_InputMap_KeyFromName(const char *name)
 {
     int i, v;
     if (!name || !*name) return -1;
     if (name[1] == 0) {
-        char c = (char)toupper((unsigned char)name[0]);
+        /* Win32 letters and digits are their uppercase ASCII codes. */
+        char c = (char)ascii_upper((unsigned char)name[0]);
         if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) return c;
         return -1;
     }
     v = numbered(name, "f", 1, 12);
-    if (v >= 0) return 0x70 + v - 1;
+    if (v >= 0) return XBOX_VK_F1 + v - 1;
     v = numbered(name, "numpad", 0, 9);
-    if (v >= 0) return 0x60 + v;
+    if (v >= 0) return XBOX_VK_NUMPAD0 + v;
     for (i = 0; i < KEY_TABLE_COUNT; i++)
-        if (equal_nocase(name, k_keys[i].name)) return k_keys[i].code;
+        if (equal_nocase(name, k_keys[i].name)) return k_keys[i].vk;
     return -1;
 }
 
-const char *input_key_name(int code)
+const char *xbox_InputMap_KeyName(int vk)
 {
-    static char generated[4][12];
-    static int next;
-    char *g;
+    static const char *const letters[] = {
+        "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"
+    };
+    static const char *const digits[] = {
+        "0", "1", "2", "3", "4", "5", "6", "7", "8", "9"
+    };
+    static const char *const functions[] = {
+        "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12"
+    };
+    static const char *const numpad[] = {
+        "Numpad0", "Numpad1", "Numpad2", "Numpad3", "Numpad4", "Numpad5", "Numpad6", "Numpad7", "Numpad8", "Numpad9"
+    };
     int i;
-    if (code >= 'A' && code <= 'Z') {
-        g = generated[next++ & 3];
-        snprintf(g, sizeof(generated[0]), "%c", code);
-        return g;
-    }
-    if (code >= '0' && code <= '9') {
-        g = generated[next++ & 3];
-        snprintf(g, sizeof(generated[0]), "%c", code);
-        return g;
-    }
-    if (code >= 0x70 && code <= 0x7B) {
-        g = generated[next++ & 3];
-        snprintf(g, sizeof(generated[0]), "F%d", code - 0x70 + 1);
-        return g;
-    }
-    if (code >= 0x60 && code <= 0x69) {
-        g = generated[next++ & 3];
-        snprintf(g, sizeof(generated[0]), "Numpad%d", code - 0x60);
-        return g;
-    }
+    if (vk >= 'A' && vk <= 'Z') return letters[vk - 'A'];
+    if (vk >= '0' && vk <= '9') return digits[vk - '0'];
+    if (vk >= XBOX_VK_F1 && vk <= XBOX_VK_F12) return functions[vk - XBOX_VK_F1];
+    if (vk >= XBOX_VK_NUMPAD0 && vk <= XBOX_VK_NUMPAD9) return numpad[vk - XBOX_VK_NUMPAD0];
     for (i = 0; i < KEY_TABLE_COUNT; i++)
-        if (k_keys[i].code == code) return k_keys[i].name;
+        if (k_keys[i].vk == vk) return k_keys[i].name;
     return NULL;
 }
 
-int input_bindings_parse(InputBindings *b, int control, const char *text)
+int xbox_InputMap_BindingsParse(InputBindings *b, int control, const char *text)
 {
     int rejected = 0;
-    char copy[256], *tok, *next;
-
-    if (!b || control < 0 || control >= INPUT_CONTROL_COUNT) return 0;
+    if (!b || control < 0 || control >= INPUT_CONTROL_COUNT) return -1;
     b->count[control] = 0;
     if (!text) return 0;
-    snprintf(copy, sizeof(copy), "%s", text);
-    for (tok = copy; tok; tok = next) {
-        char *end;
-        int code, j, dup = 0;
-        next = strchr(tok, ',');
-        if (next) *next++ = 0;
-        while (*tok && isspace((unsigned char)*tok)) tok++;
-        end = tok + strlen(tok);
-        while (end > tok && isspace((unsigned char)end[-1])) *--end = 0;
-        if (!*tok || equal_nocase(tok, "none")) continue;
-        code = input_key_from_name(tok);
-        if (code < 0) { rejected++; continue; }
-        for (j = 0; j < b->count[control]; j++)
-            if (b->key[control][j] == code) dup = 1;
-        if (dup) continue;
-        if (b->count[control] < INPUT_BINDINGS_PER_CONTROL)
-            b->key[control][b->count[control]++] = (uint16_t)code;
-        else
-            rejected++;
+    for (;;) {
+        const char *end = strchr(text, ',');
+        const char *first = text, *last = end ? end : text + strlen(text);
+        char token[32];
+        size_t len;
+        int vk, j, dup = 0;
+        while (first < last && isspace((unsigned char)*first)) first++;
+        while (last > first && isspace((unsigned char)last[-1])) last--;
+        len = (size_t)(last - first);
+        if (len) {
+            if (len >= sizeof(token)) { rejected++; }
+            else {
+                memcpy(token, first, len); token[len] = 0;
+                if (!equal_nocase(token, "none")) {
+                    vk = xbox_InputMap_KeyFromName(token);
+                    if (vk < 0) rejected++;
+                    else {
+                        for (j = 0; j < b->count[control]; j++)
+                            if (b->key[control][j] == vk) dup = 1;
+                        if (!dup) {
+                            if (b->count[control] < INPUT_BINDINGS_PER_CONTROL)
+                                b->key[control][b->count[control]++] = (uint8_t)vk;
+                            else rejected++;
+                        }
+                    }
+                }
+            }
+        }
+        if (!end) break;
+        text = end + 1;
     }
     return rejected;
 }
 
-const char *input_bindings_format(const InputBindings *b, int control, char *buf, int size)
+const char *xbox_InputMap_BindingsFormat(const InputBindings *b, int control, char *buf, int size)
 {
     int i, used = 0;
     if (!buf || size <= 0) return buf;
@@ -184,8 +201,8 @@ const char *input_bindings_format(const InputBindings *b, int control, char *buf
         snprintf(buf, (size_t)size, "none");
         return buf;
     }
-    for (i = 0; i < b->count[control]; i++) {
-        const char *n = input_key_name(b->key[control][i]);
+    for (i = 0; i < b->count[control] && i < INPUT_BINDINGS_PER_CONTROL; i++) {
+        const char *n = xbox_InputMap_KeyName(b->key[control][i]);
         int w = snprintf(buf + used, (size_t)(size - used), "%s%s", i ? ", " : "",
                          n ? n : "?");
         if (w < 0 || w >= size - used) break;
@@ -197,56 +214,52 @@ const char *input_bindings_format(const InputBindings *b, int control, char *buf
 static int control_held(const InputBindings *b, const uint8_t *down, int control)
 {
     int i;
-    for (i = 0; i < b->count[control]; i++) {
-        int k = b->key[control][i];
-        if (k < INPUT_KEY_COUNT && down[k]) return 1;
+    for (i = 0; i < b->count[control] && i < INPUT_BINDINGS_PER_CONTROL; i++) {
+        int vk = b->key[control][i];
+        if (vk && down[vk]) return 1;
     }
     return 0;
 }
 
-/* A stick from four keys: a unit-circle deflection, so a diagonal is as fast as
- * a straight line (32767 * 0.7071 on each axis). */
-static void keys_stick(int right, int left_k, int up, int down_k, int16_t *ox, int16_t *oy)
+/* A stick from four keys. Opposite keys cancel. Two directions at once are
+ * full deflection on both axes, or with INPUT_DIAGONAL_ROUND a unit-circle
+ * deflection, so a diagonal is as fast as a straight line (32767 * 0.7071 on
+ * each axis). */
+static void keys_stick(int diagonal, int right, int left_k, int up, int down_k,
+                       SHORT *ox, SHORT *oy)
 {
     int x = (right ? 1 : 0) - (left_k ? 1 : 0);
     int y = (up ? 1 : 0) - (down_k ? 1 : 0);
-    if (x && y) {
-        *ox = (int16_t)(x * 23169);
-        *oy = (int16_t)(y * 23169);
+    if (x && y && diagonal == INPUT_DIAGONAL_ROUND) {
+        *ox = (SHORT)(x * 23169);
+        *oy = (SHORT)(y * 23169);
     } else {
-        *ox = (int16_t)(x * 32767);
-        *oy = (int16_t)(y * 32767);
+        *ox = (SHORT)(x * 32767);
+        *oy = (SHORT)(y * 32767);
     }
 }
 
-void input_keys_resolve(const InputBindings *b, const uint8_t *down, InputPad *out)
+void xbox_InputMap_KeysResolve(const InputBindings *b, const uint8_t *down, XBOX_GAMEPAD *out)
 {
-    static const struct { int control; uint16_t bit; } digital[8] = {
-        { INPUT_DPAD_UP, INPUT_PAD_DPAD_UP }, { INPUT_DPAD_DOWN, INPUT_PAD_DPAD_DOWN },
-        { INPUT_DPAD_LEFT, INPUT_PAD_DPAD_LEFT }, { INPUT_DPAD_RIGHT, INPUT_PAD_DPAD_RIGHT },
-        { INPUT_START, INPUT_PAD_START }, { INPUT_BACK, INPUT_PAD_BACK },
-        { INPUT_LEFT_THUMB, INPUT_PAD_LEFT_THUMB }, { INPUT_RIGHT_THUMB, INPUT_PAD_RIGHT_THUMB },
-    };
-    /* Analog button slot for each control from INPUT_A on. */
-    static const uint8_t analog_slot[] = {
-        INPUT_ANALOG_A, INPUT_ANALOG_B, INPUT_ANALOG_X, INPUT_ANALOG_Y,
-        INPUT_ANALOG_BLACK, INPUT_ANALOG_WHITE, INPUT_ANALOG_LTRIGGER, INPUT_ANALOG_RTRIGGER,
-    };
     int i;
 
     memset(out, 0, sizeof(*out));
+    /* The digital controls are the wButtons bits in order. */
     for (i = 0; i < 8; i++)
-        if (control_held(b, down, digital[i].control)) out->buttons |= digital[i].bit;
+        if (control_held(b, down, INPUT_DPAD_UP + i)) out->wButtons |= (WORD)(1u << i);
     /* Analog on the console: a key is 255, not a flag, or a title that reads
-     * the value as a pressure never sees a press. */
+     * the value as a pressure never sees a press. INPUT_A + i is
+     * bAnalogButtons[i]. */
     for (i = 0; i < 8; i++)
-        if (control_held(b, down, INPUT_A + i)) out->analog[analog_slot[i]] = 255;
-    keys_stick(control_held(b, down, INPUT_LSTICK_RIGHT), control_held(b, down, INPUT_LSTICK_LEFT),
+        if (control_held(b, down, INPUT_A + i)) out->bAnalogButtons[XBOX_BUTTON_A + i] = 255;
+    keys_stick(b->diagonal,
+               control_held(b, down, INPUT_LSTICK_RIGHT), control_held(b, down, INPUT_LSTICK_LEFT),
                control_held(b, down, INPUT_LSTICK_UP), control_held(b, down, INPUT_LSTICK_DOWN),
-               &out->lx, &out->ly);
-    keys_stick(control_held(b, down, INPUT_RSTICK_RIGHT), control_held(b, down, INPUT_RSTICK_LEFT),
+               &out->sThumbLX, &out->sThumbLY);
+    keys_stick(b->diagonal,
+               control_held(b, down, INPUT_RSTICK_RIGHT), control_held(b, down, INPUT_RSTICK_LEFT),
                control_held(b, down, INPUT_RSTICK_UP), control_held(b, down, INPUT_RSTICK_DOWN),
-               &out->rx, &out->ry);
+               &out->sThumbRX, &out->sThumbRY);
 }
 
 /* ---- pad sources ---------------------------------------------------------- */
@@ -265,12 +278,12 @@ static const char *const k_source_names[INPUT_SRC_COUNT] = {
     "right_stick_up", "right_stick_down", "right_stick_left", "right_stick_right",
 };
 
-const char *input_source_name(int source)
+const char *xbox_InputMap_SourceName(int source)
 {
     return source >= 0 && source < INPUT_SRC_COUNT ? k_source_names[source] : NULL;
 }
 
-int input_source_from_name(const char *name)
+int xbox_InputMap_SourceFromName(const char *name)
 {
     int i;
     if (!name) return -1;
@@ -279,7 +292,7 @@ int input_source_from_name(const char *name)
     return -1;
 }
 
-void input_padmap_defaults(InputPadMap *m)
+void xbox_InputMap_PadMapDefaults(InputPadMap *m)
 {
     static const uint8_t identity[INPUT_PAD_CONTROL_COUNT] = {
         INPUT_SRC_DPAD_UP, INPUT_SRC_DPAD_DOWN, INPUT_SRC_DPAD_LEFT, INPUT_SRC_DPAD_RIGHT,
@@ -300,7 +313,7 @@ void input_padmap_defaults(InputPadMap *m)
 
 /* ---- deadzones ------------------------------------------------------------ */
 
-void input_apply_stick(int x, int y, int deadzone_pct, int16_t *ox, int16_t *oy)
+void xbox_InputMap_ApplyStick(int x, int y, int deadzone_pct, SHORT *ox, SHORT *oy)
 {
     double dz, mag, scale;
     if (deadzone_pct < 0) deadzone_pct = 0;
@@ -315,12 +328,12 @@ void input_apply_stick(int x, int y, int deadzone_pct, int16_t *ox, int16_t *oy)
     if (scale > 1.0) scale = 1.0;
     {
         double fx = x / mag * scale * 32767.0, fy = y / mag * scale * 32767.0;
-        *ox = (int16_t)(fx >= 0 ? fx + 0.5 : fx - 0.5);
-        *oy = (int16_t)(fy >= 0 ? fy + 0.5 : fy - 0.5);
+        *ox = (SHORT)(fx >= 0 ? fx + 0.5 : fx - 0.5);
+        *oy = (SHORT)(fy >= 0 ? fy + 0.5 : fy - 0.5);
     }
 }
 
-uint8_t input_apply_trigger(int value, int threshold_pct)
+uint8_t xbox_InputMap_ApplyTrigger(int value, int threshold_pct)
 {
     int thr;
     if (value < 0) value = 0;
@@ -336,34 +349,28 @@ uint8_t input_apply_trigger(int value, int threshold_pct)
 
 static int raw_value(const InputRaw *r, int source)
 {
-    return source > INPUT_SRC_NONE && source < INPUT_SRC_COUNT ? r->src[source] : 0;
+    return source > INPUT_SRC_NONE && source < INPUT_SRC_COUNT ? (r->src[source] > 0 ? r->src[source] : 0) : 0;
 }
 
-void input_pad_map(const InputPadMap *m, const InputRaw *raw, InputPad *out)
+void xbox_InputMap_PadMap(const InputPadMap *m, const InputRaw *raw, XBOX_GAMEPAD *out)
 {
-    static const uint16_t digital_bit[8] = {
-        INPUT_PAD_DPAD_UP, INPUT_PAD_DPAD_DOWN, INPUT_PAD_DPAD_LEFT, INPUT_PAD_DPAD_RIGHT,
-        INPUT_PAD_START, INPUT_PAD_BACK, INPUT_PAD_LEFT_THUMB, INPUT_PAD_RIGHT_THUMB,
-    };
-    static const uint8_t analog_slot[8] = {
-        INPUT_ANALOG_A, INPUT_ANALOG_B, INPUT_ANALOG_X, INPUT_ANALOG_Y,
-        INPUT_ANALOG_BLACK, INPUT_ANALOG_WHITE, INPUT_ANALOG_LTRIGGER, INPUT_ANALOG_RTRIGGER,
-    };
-    int press_at = 32767 * m->button_threshold / 100;
+    int pct = m->button_threshold > 100 ? 100 : m->button_threshold;
+    int press_at = 32767 * pct / 100;
     int i;
 
     memset(out, 0, sizeof(*out));
     if (press_at < 1) press_at = 1;
     for (i = 0; i < 8; i++)
-        if (raw_value(raw, m->source[i]) >= press_at) out->buttons |= digital_bit[i];
+        if (raw_value(raw, m->source[INPUT_DPAD_UP + i]) >= press_at) out->wButtons |= (WORD)(1u << i);
     /* The face buttons and shoulders are analog on the console but binary
      * here: pressed is 255. The triggers keep the pad's own travel. */
     for (i = 0; i < 6; i++)
         if (raw_value(raw, m->source[INPUT_A + i]) >= press_at)
-            out->analog[analog_slot[i]] = 255;
+            out->bAnalogButtons[XBOX_BUTTON_A + i] = 255;
     for (i = 6; i < 8; i++) {
         int v = raw_value(raw, m->source[INPUT_A + i]) >> 7;
-        out->analog[analog_slot[i]] = input_apply_trigger(v > 255 ? 255 : v, m->trigger_threshold);
+        out->bAnalogButtons[XBOX_BUTTON_A + i] =
+            xbox_InputMap_ApplyTrigger(v > 255 ? 255 : v, m->trigger_threshold);
     }
     {
         int sx = 0, sy = 0;
@@ -372,13 +379,22 @@ void input_pad_map(const InputPadMap *m, const InputRaw *raw, InputPad *out)
         case INPUT_STICK_RIGHT: sx = raw->rx; sy = raw->ry; break;
         default: break;
         }
-        input_apply_stick(sx, sy, m->deadzone_left, &out->lx, &out->ly);
+        xbox_InputMap_ApplyStick(sx, sy, m->deadzone_left, &out->sThumbLX, &out->sThumbLY);
         sx = sy = 0;
         switch (m->right_stick) {
         case INPUT_STICK_LEFT:  sx = raw->lx; sy = raw->ly; break;
         case INPUT_STICK_RIGHT: sx = raw->rx; sy = raw->ry; break;
         default: break;
         }
-        input_apply_stick(sx, sy, m->deadzone_right, &out->rx, &out->ry);
+        xbox_InputMap_ApplyStick(sx, sy, m->deadzone_right, &out->sThumbRX, &out->sThumbRY);
     }
 }
+
+/* The layout the loops above rely on. */
+#define INPUT_MAP_ASSERT(name, cond) typedef char input_map_assert_##name[(cond) ? 1 : -1]
+INPUT_MAP_ASSERT(dpad_up_bit0, XBOX_GAMEPAD_DPAD_UP == 1u << (INPUT_DPAD_UP - INPUT_DPAD_UP));
+INPUT_MAP_ASSERT(right_thumb_bit7, XBOX_GAMEPAD_RIGHT_THUMB == 1u << (INPUT_RIGHT_THUMB - INPUT_DPAD_UP));
+INPUT_MAP_ASSERT(start_bit4, XBOX_GAMEPAD_START == 1u << (INPUT_START - INPUT_DPAD_UP));
+INPUT_MAP_ASSERT(black_slot, XBOX_BUTTON_BLACK == XBOX_BUTTON_A + (INPUT_BLACK - INPUT_A));
+INPUT_MAP_ASSERT(white_slot, XBOX_BUTTON_WHITE == XBOX_BUTTON_A + (INPUT_WHITE - INPUT_A));
+INPUT_MAP_ASSERT(rtrigger_slot, XBOX_BUTTON_RTRIGGER == XBOX_BUTTON_A + (INPUT_RIGHT_TRIGGER - INPUT_A));

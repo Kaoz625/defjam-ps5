@@ -57,10 +57,10 @@ static XBOX_INPUT_STATE get(int slot, DWORD *rc)
 
 static void keys_for_test(InputHostConfig *cfg)
 {
-    input_bindings_parse(&cfg->keys, INPUT_A, "J");
-    input_bindings_parse(&cfg->keys, INPUT_LSTICK_RIGHT, "D");
-    input_bindings_parse(&cfg->keys, INPUT_DPAD_UP, "WheelUp");
-    input_bindings_parse(&cfg->keys, INPUT_START, "Enter");
+    xbox_InputMap_BindingsParse(&cfg->keys, INPUT_A, "J");
+    xbox_InputMap_BindingsParse(&cfg->keys, INPUT_LSTICK_RIGHT, "D");
+    xbox_InputMap_BindingsParse(&cfg->keys, INPUT_DPAD_UP, "WheelUp");
+    xbox_InputMap_BindingsParse(&cfg->keys, INPUT_START, "Enter");
 }
 
 int main(void)
@@ -250,7 +250,7 @@ int main(void)
     s = get(0, &rc);
     CHECK(s.Gamepad.bAnalogButtons[XBOX_BUTTON_B] == 255 && s.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 0);
     SDL_SetJoystickVirtualButton(pad1.joy, SDL_GAMEPAD_BUTTON_SOUTH, false);
-    input_padmap_defaults(&cfg.padmap);
+    xbox_InputMap_PadMapDefaults(&cfg.padmap);
     xbox_HostInputConfigure(&cfg);
 
     /* Hot-plug: a second pad takes slot 2 (index), skipping the keyboard's 1. */

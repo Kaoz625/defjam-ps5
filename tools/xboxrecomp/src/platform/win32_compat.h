@@ -91,6 +91,8 @@ LONG InterlockedIncrement(volatile LONG *Addend);
 LONG InterlockedDecrement(volatile LONG *Addend);
 LONG InterlockedExchange(volatile LONG *Target, LONG Value);
 LONG InterlockedExchangeAdd(volatile LONG *Addend, LONG Value);
+LONG InterlockedAnd(volatile LONG *Destination, LONG Value);
+LONG InterlockedOr(volatile LONG *Destination, LONG Value);
 LONG InterlockedCompareExchange(volatile LONG *Dest, LONG Exchange, LONG Comparand);
 LONGLONG InterlockedCompareExchange64(volatile LONGLONG *Dest, LONGLONG Exchange, LONGLONG Comparand);
 PVOID InterlockedCompareExchangePointer(PVOID volatile *Dest, PVOID Exchange, PVOID Comparand);
@@ -139,6 +141,8 @@ BOOL  DuplicateHandle(HANDLE srcProc, HANDLE src, HANDLE dstProc,
 HANDLE      w32_open_handle(int fd, const char *host_path);
 int         w32_handle_fd(HANDLE h);
 const char *w32_handle_path(HANDLE h);
+/* After a rename: later path-based operations on h follow the file. */
+void        w32_handle_set_path(HANDLE h, const char *host_path);
 
 /* ---- Events ----------------------------------------------------------- */
 HANDLE CreateEventA(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, BOOL initialState, LPCSTR name);
@@ -179,6 +183,14 @@ HANDLE GetCurrentProcess(void);
 DWORD  GetCurrentProcessId(void);
 BOOL   SetThreadPriority(HANDLE h, int priority);
 int    GetThreadPriority(HANDLE h);
+/* Linux: pthread_setaffinity_np on the thread; a new thread gets the
+ * process's mask, as on Win32, not its creator's. macOS has no thread
+ * affinity: the call does nothing and returns 0 (failure), as Win32 does
+ * for an invalid mask. GetProcessAffinityMask is the mask the process
+ * started with (macOS: every online core). */
+DWORD_PTR SetThreadAffinityMask(HANDLE h, DWORD_PTR mask);
+BOOL   GetProcessAffinityMask(HANDLE process, DWORD_PTR *process_mask,
+                              DWORD_PTR *system_mask);
 VOID   SwitchToThread(void);
 DWORD  QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data);
 
@@ -613,6 +625,20 @@ void guest_turn_counts(uint64_t *handoffs, uint64_t *kicks);
 /* The longest a thread that was due to run at once (woken, or time-critical)
  * has waited for the guest CPU since this was last asked. */
 long guest_turn_longest_wait_ms(void);
+/* For guest_turn_probe(): the calling thread's g_xbox_kernel_caller, the guest
+ * routine it runs (host entry and context), and the runtime's ring of recent
+ * indirect-call targets (16 entries, idx the next to write). */
+void guest_turn_note_caller(const volatile uint32_t *slot);
+void guest_turn_note_start(const void *entry, uint32_t ctx);
+void guest_turn_note_icall_ring(const volatile uint32_t *ring, const volatile uint32_t *idx);
+/* A hitch probe: writes the holder of the guest CPU (its state, how long, the
+ * guest call site, recent indirect calls, native stack) to holder and every
+ * thread's native stack to all, each one JSON object; returns the number of
+ * threads seen, 0 where unsupported (only Darwin has the token). Any thread
+ * except a guest one; costs a millisecond or two. */
+int guest_turn_probe(char *holder, size_t holder_size, char *all, size_t all_size);
+/* Something else for every probe to report, under `key`: fn writes one JSON value. */
+void guest_turn_note_extra(const char *key, int (*fn)(char *out, size_t size));
 /* Around host work that may wait and changes nothing the title can see (a log
  * line written while the log is busy): give the guest CPU up, then take it back
  * with what the first returned. */

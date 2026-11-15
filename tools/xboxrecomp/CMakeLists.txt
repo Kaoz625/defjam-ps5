@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(xboxrecomp VERSION 0.9.0 LANGUAGES C)
+project(xboxrecomp VERSION 0.14.0 LANGUAGES C)
 
 # Xbox Static Recompilation Runtime Library
 # Provides link-time libraries for statically recompiled Xbox games.
@@ -29,6 +29,15 @@ add_compile_definitions(
 # Platform: Win32/NT type vocabulary + POSIX implementation of generic
 # Win32 host primitives. Carries no Xbox semantics; provides the foundation
 # the kernel HLE and the graphics/audio/input layers build on.
+# SDL3 for the host side (Def Jam fork). Off by default: the build then needs
+# no extra dependency, pads are read through XInput on Windows, and POSIX
+# hosts use SDL2 as upstream does. On, pads go through SDL3 (DualSense, Switch
+# Pro, DirectInput and XInput under one set of names; fetched and built
+# statically on Windows), and off Windows the audio device, the keyboard and
+# the window are SDL3's too, with none of the SDL2 files built: a process
+# cannot hold SDL2 and SDL3 at once.
+option(XBOXRECOMP_SDL3 "Use SDL3 for pads (and, off Windows, the whole host side)" OFF)
+
 add_subdirectory(src/settings)
 add_subdirectory(src/platform)
 
@@ -60,8 +69,7 @@ add_subdirectory(src/video)
 # ── Umbrella target ───────────────────────────────────────────
 
 # Convenience target that links all runtime libraries
-add_library(xboxrecomp INTERFACE)
-target_link_libraries(xboxrecomp INTERFACE
+set(XBOXRECOMP_LIBS
     xbox_kernel
     xbox_d3d8
     xbox_dsound
@@ -71,4 +79,14 @@ target_link_libraries(xboxrecomp INTERFACE
     xbox_nv2a
     xbox_video
 )
+add_library(xboxrecomp INTERFACE)
+if(UNIX AND NOT APPLE)
+    # The archives call each other both ways (the APU reaches the kernel's
+    # memory map, the kernel raises the APU's interrupt). GNU ld scans each
+    # archive once, so it needs the group; MSVC and ld64 rescan on their own.
+    target_link_libraries(xboxrecomp INTERFACE
+        -Wl,--start-group ${XBOXRECOMP_LIBS} -Wl,--end-group)
+else()
+    target_link_libraries(xboxrecomp INTERFACE ${XBOXRECOMP_LIBS})
+endif()
 
