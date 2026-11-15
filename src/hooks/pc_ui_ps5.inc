@@ -26,7 +26,7 @@ const char *const k_page_names[PAGE_COUNT] = { "VIDEO", "CONTROLS", "BUTTONS", "
 
 int g_page;
 bool g_focus_first = true;      // put the cursor on the page's first row
-std::string g_help;             // the focused row's line, shown at the bottom
+std::string g_row_help;             // the focused row's line, shown at the bottom
 UiTick g_reset_until;           // "reset all settings" waits this long for the second press
 UiTick g_restart_until;         // the same for "restart to apply"
 bool g_restart_failed;          // the system said no: the player closes and starts the game
@@ -183,7 +183,7 @@ int row(const char *id, const Row &r)
 
     int asked = ROW_NONE;
     if (focused) {
-        if (r.help) g_help = r.help;
+        if (r.help) g_row_help = r.help;
         if (ImGui::IsKeyPressed(ImGuiKey_GamepadDpadLeft) || ImGui::IsKeyPressed(ImGuiKey_GamepadLStickLeft))
             asked = ROW_LEFT;
         else if (ImGui::IsKeyPressed(ImGuiKey_GamepadDpadRight) || ImGui::IsKeyPressed(ImGuiKey_GamepadLStickRight))
@@ -348,7 +348,7 @@ const char *pad_source_label(int src)
     };
     for (const auto &n : names)
         if (n.src == src) return n.name;
-    const char *raw = input_source_name(src);
+    const char *raw = xbox_InputMap_SourceName(src);
     return raw ? raw : "?";
 }
 
@@ -381,12 +381,12 @@ void draw_tester()
     }
     InputPadMap map;
     pc_input_current_padmap(&map);
-    InputPad pad;
-    input_pad_map(&map, &raw, &pad);
+    XBOX_GAMEPAD pad;                   // [ps5 port] 1.1.2: the toolkit's pad map writes the Xbox report
+    xbox_InputMap_PadMap(&map, &raw, &pad);
     float r = F * 1.35f;
     for (int stick = 0; stick < 2; stick++) {
         ImVec2 c(x + r, cy);
-        float sx = (stick ? pad.rx : pad.lx) / 32767.0f, sy = (stick ? pad.ry : pad.ly) / 32767.0f;
+        float sx = (stick ? pad.sThumbRX : pad.sThumbLX) / 32767.0f, sy = (stick ? pad.sThumbRY : pad.sThumbLY) / 32767.0f;
         dl->AddCircle(c, r, IM_COL32(255, 255, 255, 60), 40, F * 0.08f);
         dl->AddLine(ImVec2(c.x - r * 0.25f, c.y), ImVec2(c.x + r * 0.25f, c.y), kLine);
         dl->AddLine(ImVec2(c.x, c.y - r * 0.25f), ImVec2(c.x, c.y + r * 0.25f), kLine);
@@ -397,9 +397,9 @@ void draw_tester()
     static const char *const digital[8] = { "Up", "Down", "Left", "Right", "Options", "Touchpad", "L3", "R3" };
     std::string held;
     for (int i = 0; i < 8; i++)
-        if (pad.analog[i] > 30) { held += held.empty() ? "" : "  "; held += analog[i]; }
+        if (pad.bAnalogButtons[i] > 30) { held += held.empty() ? "" : "  "; held += analog[i]; }
     for (int i = 0; i < 8; i++)
-        if (pad.buttons & (1 << i)) { held += held.empty() ? "" : "  "; held += digital[i]; }
+        if (pad.wButtons & (1 << i)) { held += held.empty() ? "" : "  "; held += digital[i]; }
     x += F * 0.4f;
     text_mid(dl, display_font(), F * 0.85f, x, cy - F * 0.62f, kTextDim, "THE GAME SEES");
     text_mid(dl, f, F, x, cy + F * 0.5f, held.empty() ? kTextFaint : kText, held.empty() ? "Nothing pressed" : held.c_str());
@@ -455,17 +455,17 @@ void page_buttons()
     {
         Row r = { "Reset to default", "", "Every button back to where the game had it.", ROW_ACTION, false, 0.0f, false };
         if (row("reset", r) == ROW_PRESS) {
-            for (const auto &c : controls) recomp_settings_reset_to_default("gamepad", input_control_name(c.control));
+            for (const auto &c : controls) recomp_settings_reset_to_default("gamepad", xbox_InputMap_ControlName(c.control));
             commit();
         }
     }
 
     section("IN THE GAME  ·  YOUR BUTTON");
     for (const auto &c : controls) {
-        const char *key = input_control_name(c.control);
+        const char *key = xbox_InputMap_ControlName(c.control);
         RecompSetting *s = find("gamepad", key);
         if (!s) continue;
-        int cur = input_source_from_name(s->stored_text);
+        int cur = xbox_InputMap_SourceFromName(s->stored_text);
         bool this_one = detecting && g_capture.key == key;
         Row r = { c.name, this_one ? "Press a button…" : pad_source_label(cur < 0 ? INPUT_SRC_NONE : cur),
                   this_one ? "Press the button to use. Nothing in 5 seconds keeps the old one."
@@ -479,7 +479,7 @@ void page_buttons()
             for (int i = 0; i < n_sources; i++)
                 if (k_pad_sources[i] == cur) at = i;
             at = (at + (asked == ROW_LEFT ? -1 : 1) + n_sources) % n_sources;
-            recomp_settings_set_text("gamepad", key, input_source_name(k_pad_sources[at]));
+            recomp_settings_set_text("gamepad", key, xbox_InputMap_SourceName(k_pad_sources[at]));
             commit();
         }
     }
@@ -584,8 +584,8 @@ void footer()
     ImDrawList *dl = ImGui::GetWindowDrawList();
     ImFont *f = ImGui::GetFont(), *d = display_font();
     dl->AddLine(ImVec2(p.x, p.y), ImVec2(p.x + w, p.y), kLine, 1.0f);
-    if (!g_help.empty())
-        dl->AddText(f, F * 0.95f, ImVec2(p.x + F * 0.85f, p.y + F * 0.35f), kTextSoft, g_help.c_str(), nullptr, w - F * 1.7f);
+    if (!g_row_help.empty())
+        dl->AddText(f, F * 0.95f, ImVec2(p.x + F * 0.85f, p.y + F * 0.35f), kTextSoft, g_row_help.c_str(), nullptr, w - F * 1.7f);
 
     // What the buttons do, from the right. Triangle restarts when a change waits for it.
     float cy = p.y + F * 2.75f, gh = F * 0.9f, fs = F * 1.0f, x = p.x + w - F * 0.85f;
@@ -667,7 +667,7 @@ UiResult ui_draw(UiMode, float x, float y, float width, float height)
     header();
     tabs();
 
-    g_help.clear();
+    g_row_help.clear();
     if (g_focus_first) ImGui::SetNextWindowScroll(ImVec2(0.0f, 0.0f));
     ImGui::BeginChild(k_page_names[g_page], ImVec2(0, -footer_height()), ImGuiChildFlags_NavFlattened);
     switch (g_page) {

@@ -78,6 +78,8 @@ size_t shaderc_result_get_length(const shaderc_compilation_result_t result);
 const char *shaderc_result_get_bytes(const shaderc_compilation_result_t result);
 shaderc_compilation_status shaderc_result_get_compilation_status(const shaderc_compilation_result_t result);
 const char *shaderc_result_get_error_message(const shaderc_compilation_result_t result);
+/* The SPIR-V version and the generator's revision, for keying a shader cache (d3d8_vk.c). */
+void shaderc_get_spv_version(unsigned int *version, unsigned int *revision);
 
 #ifdef __cplusplus
 }

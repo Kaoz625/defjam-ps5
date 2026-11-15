@@ -50,7 +50,10 @@ static int g_xa2_frames_written;
 static int g_dry;                            /* the output is in a gap */
 static int g_primed;                         /* enough is queued to play from */
 static int g_drain_expected;                 /* xa2_expect_drain: the next gap is not an underrun */
-int  g_xa2_dropped, g_xa2_starved;
+/* The backend's own counts. apu_core.c keeps the shared g_xa2_dropped and
+ * g_xa2_starved (the d3d11 translator's HUD reads them): it adds a refused
+ * submission itself and takes the gaps from xa2_underruns(). */
+static int s_refused, s_gaps;
 
 /* A gap starts and ends with a 64-frame ramp, so neither edge clicks. */
 #define XA2_FADE 64
@@ -99,7 +102,7 @@ static void ring_pull(int16_t (*out)[XA2_CHANNELS], unsigned want)
         if (!g_dry && g_xa2_frames_written > 0) {
             g_dry = 1;
             if (!g_drain_expected)
-                g_xa2_starved++;
+                s_gaps++;
         }
         g_primed = 0;
     } else {
@@ -199,16 +202,16 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
         return 0;
     {
         static int told, seen;
-        if (g_xa2_starved != seen && told < 60) {
+        if (s_gaps != seen && told < 60) {
             fprintf(stderr, "[XA2] the device ran dry (gap %d, %d frames written, %d submissions refused)\n",
-                    g_xa2_starved, g_xa2_frames_written, g_xa2_dropped);
+                    s_gaps, g_xa2_frames_written, s_refused);
             told++;
         }
-        seen = g_xa2_starved;
+        seen = s_gaps;
     }
     pthread_mutex_lock(&g_ring_lock);
     if (g_ring_w - g_ring_r + n > XA2_RING_MAX) {
-        g_xa2_dropped++;
+        s_refused++;
         ok = 0;
     } else {
         for (i = 0; i < n; i++)
@@ -236,7 +239,7 @@ int xa2_queued_samples(void)
 
 void xa2_expect_drain(void) { g_drain_expected = 1; }
 
-unsigned xa2_underruns(void) { return (unsigned)g_xa2_starved; }
+unsigned xa2_underruns(void) { return (unsigned)s_gaps; }
 
 uint64_t xa2_samples_played(void)
 {

@@ -131,3 +131,11 @@ const char *shaderc_result_get_error_message(const shaderc_compilation_result_t 
 { return r ? r->error.c_str() : "no result"; }
 
 }  // extern "C"
+
+/* [ps5 port] Upstream 1.1.2 keys its shader cache on this: SPIR-V 1.0 (the target above) and
+ * glslang's own SPIR-V generator revision. */
+extern "C" void shaderc_get_spv_version(unsigned int *version, unsigned int *revision)
+{
+    if (version) *version = 0x00010000u;
+    if (revision) *revision = (unsigned int)glslang::GetSpirvGeneratorVersion();
+}

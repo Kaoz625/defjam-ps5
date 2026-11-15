@@ -27,6 +27,7 @@ elseif(PS5)
     # ps5/shaderc (glslang). Both targets are made by ps5/cmake/ps5.cmake.
     add_library(xbox_d3d8 STATIC
         d3d8_vk.c
+        d3d8_vk_cache.c
         d3d8_formats.c
         d3d8_combiners.c
     )

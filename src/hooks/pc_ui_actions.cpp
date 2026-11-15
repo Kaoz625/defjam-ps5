@@ -107,6 +107,9 @@ static bool spawn_detached(const std::string &program, std::vector<std::string> 
     posix_spawnattr_init(&attr);
     posix_spawn_file_actions_t files;
     posix_spawn_file_actions_init(&files);
+#ifndef __GLIBC_PREREQ
+#define __GLIBC_PREREQ(maj, min) 0   /* [ps5 port] not glibc: the #elif below must still parse */
+#endif
 #if defined(__APPLE__)
     // The installed app's play.lock fd survives exec; it must not reach setup.
     posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT);

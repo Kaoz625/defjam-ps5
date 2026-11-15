@@ -170,6 +170,9 @@ bool mod_start(const std::string &requested, const std::string &id) {
     for (auto &arg : args) argv.push_back(arg.data()); argv.push_back(nullptr);
     posix_spawnattr_t attr; posix_spawnattr_init(&attr);
     posix_spawn_file_actions_t files; posix_spawn_file_actions_init(&files);
+#ifndef __GLIBC_PREREQ
+#define __GLIBC_PREREQ(maj, min) 0   /* [ps5 port] not glibc: the #elif below must still parse */
+#endif
 #if defined(__APPLE__)
     posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT);
 #elif defined(__GLIBC__) && __GLIBC_PREREQ(2,34)
