@@ -403,7 +403,16 @@ void xbox_kernel_init(void)
     g_log_cs_init = TRUE;
 
     /* Try to open log file, fall back to stderr */
+#if defined(__PROSPERO__)
+    {   /* [ps5 port] no working folder on the console: beside the other logs */
+        char path[512];
+        const char *data = getenv("DEFJAM_DATA");
+        snprintf(path, sizeof path, "%s/logs/xbox_kernel.log", data ? data : "/app0");
+        g_log_file = fopen(path, "w");
+    }
+#else
     g_log_file = fopen("xbox_kernel.log", "w");
+#endif
 
     /* Set log level from environment variable if present */
     const char* log_env = getenv("XBOX_LOG_LEVEL");

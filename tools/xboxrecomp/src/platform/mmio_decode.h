@@ -142,10 +142,14 @@ static inline int mmio_alu(mmio_ctx_t ctx, int n, uint64_t a, uint64_t b,
 }
 
 /* 1 if the instruction at ctx->Rip was serviced and Rip advanced past it. */
+#ifndef MMIO_CODE_PTR
+#define MMIO_CODE_PTR(rip) ((const uint8_t *)(rip))
+#endif
+
 static inline int mmio_emulate(mmio_ctx_t ctx, uint32_t off, void *dev,
                                mmio_read_fn rd, mmio_write_fn wr)
 {
-    const uint8_t *ip = (const uint8_t *)ctx->Rip;
+    const uint8_t *ip = MMIO_CODE_PTR(ctx->Rip);
     int prefix = 0, has66 = 0, rex = 0, has_rex = 0;
     const uint8_t *op;
     int size, rex_w, rex_r, rex_b, mlen, reg;

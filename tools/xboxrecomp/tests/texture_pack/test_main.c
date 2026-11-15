@@ -351,6 +351,49 @@ int main(void)
         for(spins=0;spins<2000 && upload_png_async(&device,&g_entries[0],&source,0)==-2;spins++) nap_ms(1);
         release_entry(&device,&g_entries[0]);
     }
+    /* Compressed replacements: an opaque picture becomes DXT1, one with alpha DXT5, every level in
+     * blocks; the disk copy is read back instead of the PNG the next time, and a changed PNG is not. */
+    {
+        uint8_t solid[8*8*4],cut[8*8*4]; char cache[1024]; unsigned k; int64_t hits;
+        MockTexture *c;
+        for(k=0;k<64;k++) { solid[k*4]=40; solid[k*4+1]=120; solid[k*4+2]=200; solid[k*4+3]=255; }
+        memcpy(cut,solid,sizeof cut); for(k=0;k<32;k++) cut[k*4+3]=0;
+        snprintf(cache,sizeof cache,"%s/cache",root); make_dir(cache);
+        g_compress=1; snprintf(g_disk,sizeof g_disk,"%s",cache); g_disk_cap=1u<<30; g_disk_used=0;
+        g_budget=1u<<20;
+        snprintf(path,sizeof path,"%s/solid.png",root); assert(write_png(path,solid,8,8));
+        snprintf(g_entries[0].path,PATH_CAP,"%s",path);
+        source=(RecompTextureSource){1,6,2,2,2,pixel,16,0,0,0,NULL,0};      /* a 2x2 source at 4x */
+        assert(upload_png(&device,&g_entries[0],&source)==1);
+        c=(MockTexture *)g_entries[0].texture;
+        assert(c->block==8 && c->levels==4 && c->width==8 && c->uploads==4);
+        /* BGRA 200,120,40 is RGB 40,120,200: the 565 end points hold it (R in the top bits). */
+        { unsigned c0=c->mips[0][0]|(c->mips[0][1]<<8); assert((c0>>11)==(200>>3) || (c0>>11)==(200>>3)+1 || (c0>>11)==(200>>3)-1); }
+        assert(g_entries[0].bytes==(uint64_t)(32+8+8+8)*2 && g_disk_writes==1);
+        release_entry(&device,&g_entries[0]);
+        hits=g_disk_hits;
+        assert(upload_png(&device,&g_entries[0],&source)==1 && g_disk_hits==hits+1);
+        c=(MockTexture *)g_entries[0].texture; assert(c->block==8 && c->levels==4);
+        release_entry(&device,&g_entries[0]);
+        assert(write_png(path,cut,8,8));                  /* another picture: decoded again */
+        assert(upload_png(&device,&g_entries[0],&source)==1 && g_disk_hits==hits+1);
+        c=(MockTexture *)g_entries[0].texture;
+        assert(c->block==16 && c->mips[0][0]==0 && c->mips[0][1]==0);   /* the top row's alpha is 0 */
+        release_entry(&device,&g_entries[0]);
+        { /* the odd size stays BGRA */
+            uint8_t odd[12*4*4]; for(k=0;k<48;k++) { odd[k*4]=1; odd[k*4+1]=2; odd[k*4+2]=3; odd[k*4+3]=255; }
+            source=(RecompTextureSource){1,6,3,1,3,pixel,12,0,0,0,NULL,0};
+            assert(write_png(path,odd,6,2));
+            assert(upload_png(&device,&g_entries[0],&source)==1 && ((MockTexture *)g_entries[0].texture)->block==0);
+            release_entry(&device,&g_entries[0]);
+        }
+        g_compress=0; g_disk[0]=0;
+        remove_file(path);
+        {
+            char name[PATH_CAP]; disk_name(name,g_entries[0].id,path); remove_file(name);
+        }
+        remove_dir(cache);
+    }
     texture_pack_shutdown(&device);
 #if defined(_WIN32)
     CoUninitialize();

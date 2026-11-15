@@ -1592,6 +1592,13 @@ void pgraph_d3d11_set_placement(float kx, float bx)
     d3d8_SetDrawPlacement(kx, bx);
 }
 
+/* y becomes y * ky + by, in the title's pixels (a 2D batch drawn larger). */
+void pgraph_d3d11_set_placement_y(float ky, float by)
+{
+    extern void d3d8_SetDrawPlacementY(float ky, float by);
+    d3d8_SetDrawPlacementY(ky, by);
+}
+
 void pgraph_d3d11_set_point_mode(int on, float size)
 {
     extern void d3d8_Nv2aPointMode(int on, float fixed_size);

@@ -36,8 +36,22 @@
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <pthread/qos.h>
+#elif defined(__FreeBSD__)
+#include <sys/stat.h>   /* [ps5 port] FreeBSD has no sysinfo(2) */
 #else
 #include <sys/sysinfo.h>
+#endif
+
+#if defined(__PROSPERO__)
+/* [ps5 port] Guest memory in the console's direct memory, inside reserved
+ * address ranges (the PS5 SDK's platform layer, as the FIFA Street port maps
+ * its guest). An app's ordinary anonymous and shared memory comes from a
+ * small flexible pool, and a 4 GB reservation made of it fails. */
+#include <ps5platform/shm.h>
+#endif
+
+#ifndef MAP_NORESERVE
+#define MAP_NORESERVE 0   /* FreeBSD (and so the PS5): reservations never commit */
 #endif
 
 /* ===================================================================== */
@@ -112,6 +126,13 @@ static int       gc_urgent_waiting;         /* urgent threads waiting for the CP
 static pthread_key_t  gc_key;
 static pthread_once_t gc_once = PTHREAD_ONCE_INIT;
 static __thread gc_thread *t_gc;
+
+/* Whether the calling thread asked for TIME_CRITICAL (the title's audio
+ * writer): the runtime's GPU hold lets such a thread through. */
+int w32_thread_is_urgent(void)
+{
+    return t_gc && t_gc->urgent;
+}
 
 static void gc_release(gc_thread *t)
 {
@@ -642,6 +663,10 @@ typedef struct w32_object {
     int             fd;
     SIZE_T          map_size;
     char           *file_path;
+#if defined(__PROSPERO__)
+    struct ps5_shm  shm;            /* direct memory behind a file mapping */
+    int             has_shm;
+#endif
 } w32_object;
 
 /* pseudo handles for "current thread"/"current process" */
@@ -1056,11 +1081,43 @@ BOOL ReleaseMutex(HANDLE h)
 /* Threads                                                               */
 /* ===================================================================== */
 
+#if defined(__PROSPERO__)
+/* [ps5 port] The CPUs a host-side thread may use: every one but the guest's.
+ * A thread inherits its creator's CPU, so a USB or GPU helper started from a
+ * guest thread landed on the guest CPU and waited behind the title (input
+ * reports came late). kernel_bridge.c sets this when it pins the guest; a
+ * guest thread pins itself again as it starts. */
+volatile uint64_t g_ps5_host_cpu_mask;
+/* The CPU the title's threads share, when the host chose it before any thread
+ * started (host_ps5.c); -1 leaves the choice to xbox_PinToGuestCore. */
+volatile int g_ps5_guest_cpu = -1;
+extern void *scePthreadSelf(void);
+extern int scePthreadSetaffinity(void *thread, uint64_t mask);
+#endif
+
 static void *thread_trampoline(void *arg)
 {
     w32_object *o = (w32_object *)arg;
     t_self_obj = o;
     t_tid      = o->tid;
+#if defined(__PROSPERO__)
+    {
+        extern void ps5_prof_register(const char *name) __attribute__((weak));
+        if (ps5_prof_register) {
+            char name[40];
+            snprintf(name, sizeof name, "thread %lx", (unsigned long)(uintptr_t)o->start);
+            ps5_prof_register(name);
+        }
+    }
+    if (g_ps5_host_cpu_mask) {
+        struct sched_param sp;
+        int pol = 0;
+        scePthreadSetaffinity(scePthreadSelf(), g_ps5_host_cpu_mask);
+        memset(&sp, 0, sizeof sp);
+        pthread_getschedparam(pthread_self(), &pol, &sp);
+        pthread_setschedparam(pthread_self(), SCHED_RR, &sp);
+    }
+#endif
 
     /* CREATE_SUSPENDED gate */
     pthread_mutex_lock(&o->lock);
@@ -1070,6 +1127,13 @@ static void *thread_trampoline(void *arg)
 
     DWORD rc = o->start ? o->start(o->start_param) : 0;
     gc_block();   /* a thread that ran guest code is leaving the guest CPU */
+#if defined(__PROSPERO__)
+    {
+        extern void ps5_prof_unregister(void) __attribute__((weak));
+        if (ps5_prof_unregister)
+            ps5_prof_unregister();
+    }
+#endif
 
     pthread_mutex_lock(&o->lock);
     o->exit_code = rc;
@@ -1185,6 +1249,34 @@ BOOL SetThreadPriority(HANDLE h, int priority)
         o->priority = priority;
         if (o->gc)
             ((gc_thread *)o->gc)->urgent = priority >= THREAD_PRIORITY_TIME_CRITICAL;
+#if defined(__PROSPERO__)
+        /* [ps5 port] A real priority for a time-critical thread. Every title
+         * thread is round robin at 700 on one CPU, and Def Jam's audio writer
+         * (the one thread it makes TIME_CRITICAL) refills a ring about 20 ms
+         * ahead of the voice processor: queued behind a title thread spinning
+         * for the GPU, it came back late and the last lap replayed, a
+         * crackle. 668 preempts the title as it would on the console, and
+         * stays under the interrupt thread's 636. It sleeps between refills. */
+        if (!o->exited && (h == PSEUDO_CURRENT_THREAD || o == t_self_obj || o->thread)) {
+            pthread_t th = (h == PSEUDO_CURRENT_THREAD || o == t_self_obj) ? pthread_self() : o->thread;
+            struct sched_param sp;
+            int pol = 0, e = 0, want = -1;
+            static int told;
+            memset(&sp, 0, sizeof sp);
+            pthread_getschedparam(th, &pol, &sp);
+            if (priority >= THREAD_PRIORITY_TIME_CRITICAL)
+                want = 668;
+            else if (sp.sched_priority == 668)
+                want = 700;             /* taken back down: back with the title */
+            if (want > 0 && sp.sched_priority != want) {
+                sp.sched_priority = want;
+                e = pthread_setschedparam(th, SCHED_RR, &sp);
+                if (told++ < 32)
+                    fprintf(stderr, "  [KERNEL] thread %lu priority %d -> RR %d (%s)\n",
+                            (unsigned long)(uintptr_t)th, priority, want, e ? "refused" : "ok");
+            }
+        }
+#endif
     }
     if (t_gc && (h == PSEUDO_CURRENT_THREAD || (o && o == t_self_obj)))
         t_gc->urgent = priority >= THREAD_PRIORITY_TIME_CRITICAL;
@@ -1680,8 +1772,62 @@ static int arena_release(void *addr, size_t len, BOOL *ok)
     return 1;
 }
 
+#if defined(__PROSPERO__)
+/* Views of direct memory, so UnmapViewOfFile can tell them from mmap's. */
+#define PS5_VIEWS_MAX 128
+static struct { uintptr_t addr; size_t len; } s_ps5_views[PS5_VIEWS_MAX];
+static pthread_mutex_t s_ps5_views_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void ps5_view_add(void *addr, size_t len)
+{
+    int i;
+    pthread_mutex_lock(&s_ps5_views_lock);
+    for (i = 0; i < PS5_VIEWS_MAX; i++)
+        if (!s_ps5_views[i].addr) {
+            s_ps5_views[i].addr = (uintptr_t)addr;
+            s_ps5_views[i].len = len;
+            break;
+        }
+    pthread_mutex_unlock(&s_ps5_views_lock);
+}
+
+static size_t ps5_view_take(const void *addr)
+{
+    int i;
+    size_t len = 0;
+    pthread_mutex_lock(&s_ps5_views_lock);
+    for (i = 0; i < PS5_VIEWS_MAX; i++)
+        if (s_ps5_views[i].addr == (uintptr_t)addr) {
+            len = s_ps5_views[i].len;
+            s_ps5_views[i].addr = 0;
+            break;
+        }
+    pthread_mutex_unlock(&s_ps5_views_lock);
+    return len;
+}
+#endif
+
 LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD protect)
 {
+#if defined(__PROSPERO__)
+    /* [ps5 port] Address space only: a reserved range, which costs no memory.
+     * (PAGE_NOACCESS maps to prot 0, which the mmap below would turn into
+     * read-write memory -- 4 GB of it for the guest window.) */
+    if (!address && (allocationType & MEM_RESERVE) && !(allocationType & MEM_COMMIT)) {
+        void *base = NULL;
+        int rc = ps5_vrange_reserve(size, NULL, 0x10000, &base);
+        if (rc != 0 || !base) {
+            fprintf(stderr, "[PS5] reserving %zu MB of address space failed (0x%x)\n",
+                    size >> 20, (unsigned)rc);
+            SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+            return NULL;
+        }
+        view_register(base, size);
+        return base;
+    }
+    if (!(allocationType & MEM_COMMIT))
+        protect = PAGE_NOACCESS;   /* reserve only: no access, and no memory */
+#endif
     int prot  = prot_from_page(protect);
     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
     int arena = address ? arena_state(address, size) : ARENA_OUTSIDE;
@@ -1713,7 +1859,17 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD pro
         p = mach_map_fixed(address, size, prot ? prot : PROT_READ | PROT_WRITE);
     } else
 #endif
+#if defined(__PROSPERO__)
+    if (!(allocationType & MEM_COMMIT))
+        flags |= MAP_NORESERVE;
+    p = mmap(address, size, (allocationType & MEM_COMMIT) ? (prot ? prot : PROT_READ | PROT_WRITE)
+                                                          : PROT_NONE, flags, -1, 0);
+    if (p == MAP_FAILED)
+        fprintf(stderr, "[PS5] VirtualAlloc %p+%zu MB failed (errno %d)\n",
+                address, size >> 20, errno);
+#else
     p = mmap(address, size, prot ? prot : PROT_READ | PROT_WRITE, flags, -1, 0);
+#endif
     if (p == MAP_FAILED) {
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return NULL;
@@ -1824,14 +1980,107 @@ VOID GetLocalTime(LPSYSTEMTIME st)
     fill_systemtime(st, &tm, ts.tv_nsec);
 }
 
+#if defined(__PROSPERO__)
+/* [ps5 port] clock_gettime is a system call on the PS5, about 0.9 us each,
+ * and the clock is read everywhere: the GPU executor stamps every texture it
+ * binds (15% of that thread in a fight), the title's own QueryPerformanceCounter
+ * loop is 10% of its main thread. The console's time stamp counter is
+ * invariant and shared by every core, and libkernel reads it without entering
+ * the kernel; its frequency is fixed at boot. */
+extern uint64_t sceKernelReadTsc(void);
+extern uint64_t sceKernelGetTscFrequency(void);
+
+static uint64_t s_tsc_hz, s_tsc_reported, s_tsc_measured;
+static pthread_once_t s_tsc_once = PTHREAD_ONCE_INIT;
+
+/* The reported frequency is checked once against clock_gettime over 20 ms:
+ * every clock the title sees is scaled by it, so a wrong value would run the
+ * whole game fast or slow. More than 2% apart and the clocks stay on
+ * clock_gettime. */
+static void ps5_tsc_init(void)
+{
+    int attempt;
+    s_tsc_reported = sceKernelGetTscFrequency();
+    s_tsc_hz = 1;   /* the clock_gettime fallback */
+    /* Up to three tries: a thread descheduled between the two clock reads of
+     * one try skews only that try. Each read of the system clock sits between
+     * two counter reads, so the pairing is tight. */
+    for (attempt = 0; attempt < 3 && s_tsc_hz == 1; attempt++) {
+        struct timespec a, b, d = { 0, 20 * 1000000L };
+        uint64_t t0a, t0b, t1a, t1b, ns;
+        t0a = sceKernelReadTsc();
+        clock_gettime(CLOCK_MONOTONIC, &a);
+        t0b = sceKernelReadTsc();
+        while (nanosleep(&d, &d) == -1 && errno == EINTR) { }
+        t1a = sceKernelReadTsc();
+        clock_gettime(CLOCK_MONOTONIC, &b);
+        t1b = sceKernelReadTsc();
+        ns = (uint64_t)(b.tv_sec - a.tv_sec) * 1000000000ULL + (uint64_t)b.tv_nsec - (uint64_t)a.tv_nsec;
+        s_tsc_measured = ns ? (uint64_t)(((double)(t1a + t1b) - (double)(t0a + t0b)) / 2.0
+                                         * 1e9 / (double)ns) : 0;
+        if (s_tsc_reported && s_tsc_measured) {
+            double r = (double)s_tsc_measured / (double)s_tsc_reported;
+            if (r > 0.98 && r < 1.02)
+                s_tsc_hz = s_tsc_reported;
+        }
+    }
+}
+
+static uint64_t ps5_tsc_hz(void)
+{
+    pthread_once(&s_tsc_once, ps5_tsc_init);
+    return s_tsc_hz;
+}
+
+/* For the start-up log: what libkernel said, what was measured, what is used
+ * (1 = clock_gettime). */
+void ps5_tsc_info(uint64_t *reported, uint64_t *measured, uint64_t *used)
+{
+    ps5_tsc_hz();
+    *reported = s_tsc_reported;
+    *measured = s_tsc_measured;
+    *used = s_tsc_hz;
+}
+
+ULONGLONG GetTickCount64(void)
+{
+    uint64_t hz = ps5_tsc_hz();
+    if (hz > 1) {
+        uint64_t t = sceKernelReadTsc();
+        return (ULONGLONG)((t / hz) * 1000ULL + ((t % hz) * 1000ULL) / hz);
+    }
+    {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return (ULONGLONG)ts.tv_sec * 1000ULL + (ULONGLONG)ts.tv_nsec / 1000000ULL;
+    }
+}
+
+BOOL QueryPerformanceCounter(PLARGE_INTEGER count)
+{
+    if (ps5_tsc_hz() > 1) {
+        count->QuadPart = (LONGLONG)sceKernelReadTsc();
+    } else {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        count->QuadPart = (LONGLONG)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    }
+    return TRUE;
+}
+
+BOOL QueryPerformanceFrequency(PLARGE_INTEGER freq)
+{
+    uint64_t hz = ps5_tsc_hz();
+    freq->QuadPart = hz > 1 ? (LONGLONG)hz : 1000000000LL;
+    return TRUE;
+}
+#else
 ULONGLONG GetTickCount64(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (ULONGLONG)ts.tv_sec * 1000ULL + (ULONGLONG)ts.tv_nsec / 1000000ULL;
 }
-
-DWORD GetTickCount(void) { return (DWORD)GetTickCount64(); }
 
 BOOL QueryPerformanceCounter(PLARGE_INTEGER count)
 {
@@ -1846,6 +2095,9 @@ BOOL QueryPerformanceFrequency(PLARGE_INTEGER freq)
     freq->QuadPart = 1000000000LL;   /* QPC is in nanoseconds */
     return TRUE;
 }
+#endif
+
+DWORD GetTickCount(void) { return (DWORD)GetTickCount64(); }
 
 /* ===================================================================== */
 /* Misc                                                                  */
@@ -1856,7 +2108,21 @@ VOID OutputDebugStringA(LPCSTR str)
     if (str) fputs(str, stderr);
 }
 
-VOID ExitProcess(UINT exitCode) { exit((int)exitCode); }
+#if defined(__PROSPERO__)
+/* [ps5 port] The app ends through the system (back to the home screen), with
+ * its logs written out, not through the C library's teardown while the audio
+ * and GPU threads are inside the console's drivers. host_ps5.c. */
+extern void ps5_exit_app(int code) __attribute__((weak, noreturn));
+#endif
+
+VOID ExitProcess(UINT exitCode)
+{
+#if defined(__PROSPERO__)
+    if (ps5_exit_app)
+        ps5_exit_app((int)exitCode);
+#endif
+    exit((int)exitCode);
+}
 
 BOOL IsDebuggerPresent(void)
 {
@@ -2041,6 +2307,10 @@ DWORD XInputGetState(DWORD idx, XINPUT_STATE *state)
 BOOL TerminateProcess(HANDLE process, UINT exitCode)
 {
     (void)process;
+#if defined(__PROSPERO__)
+    if (ps5_exit_app)
+        ps5_exit_app((int)exitCode);
+#endif
     exit((int)exitCode);
 }
 
@@ -2189,6 +2459,11 @@ static int anon_map_fd(const char *name)
     int fd = shm_open(shm_name, O_CREAT | O_RDWR | O_EXCL, 0600);
     if (fd >= 0) shm_unlink(shm_name);
     return fd;
+#elif defined(__PROSPERO__)
+    /* [ps5 port] An anonymous shared memory object, as the FIFA Street port
+     * maps its mirrored guest memory on the PS5. */
+    (void)name;
+    return shm_open(SHM_ANON, O_RDWR | O_CREAT, 0600);
 #else
     return memfd_create(name ? name : "xbox_map", 0);
 #endif
@@ -2201,6 +2476,26 @@ HANDLE CreateFileMappingA(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
     SIZE_T size = ((SIZE_T)maxSizeHigh << 32) | maxSizeLow;
     if (size == 0) { SetLastError(ERROR_INVALID_PARAMETER); return NULL; }
 
+#if defined(__PROSPERO__)
+    {
+        w32_object *o;
+        struct ps5_shm shm;
+        int rc = ps5_shm_create(size, &shm);
+        if (rc != 0) {
+            fprintf(stderr, "[PS5] %zu MB of direct memory for a file mapping: failed (0x%x)\n",
+                    size >> 20, (unsigned)rc);
+            SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+            return NULL;
+        }
+        (void)name;
+        o = obj_alloc(K_FILEMAP);
+        o->fd       = -1;
+        o->map_size = size;
+        o->shm      = shm;
+        o->has_shm  = 1;
+        return (HANDLE)o;
+    }
+#endif
     int fd = anon_map_fd(name);
     if (fd < 0) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
     if (ftruncate(fd, (off_t)size) != 0) {
@@ -2238,6 +2533,34 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
         SetLastError(ERROR_INVALID_ADDRESS);
         return NULL;
     }
+
+#if defined(__PROSPERO__)
+    if (o->has_shm) {
+        void *view = NULL;
+        int rc;
+        /* A fixed view goes only where it replaces our own reservation: a
+         * fixed map anywhere else would replace whatever lives there,
+         * the program's own code included. */
+        if (baseAddr && arena != ARENA_FREE) {
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return NULL;
+        }
+        rc = ps5_shm_map(&o->shm, (size_t)off, len, baseAddr,
+                         PS5_SHM_READ | (access != FILE_MAP_READ ? PS5_SHM_WRITE : 0),
+                         baseAddr ? PS5_SHM_FIXED : 0, &view);
+        if (rc != 0 || !view || (baseAddr && view != baseAddr)) {
+            fprintf(stderr, "[PS5] mapping a view at %p (%zu MB) failed (0x%x)\n",
+                    baseAddr, (size_t)len >> 20, (unsigned)rc);
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return NULL;
+        }
+        if (arena == ARENA_FREE)
+            arena_mark(view, len, 1);
+        view_register(view, len);
+        ps5_view_add(view, len);
+        return view;
+    }
+#endif
 
     /* Win32 MapViewOfFileEx *fails* when the requested address is unavailable.
      * Plain MAP_FIXED does the opposite: it silently unmaps whatever is there
@@ -2290,6 +2613,15 @@ BOOL UnmapViewOfFile(LPCVOID baseAddr)
     size_t len = view_take(baseAddr);
     BOOL ok;
     if (len == 0) return FALSE;
+#if defined(__PROSPERO__)
+    if (ps5_view_take(baseAddr)) {
+        int in_arena = arena_state((void *)baseAddr, len) != ARENA_OUTSIDE;
+        ok = ps5_shm_unmap((void *)baseAddr, len, in_arena ? PS5_SHM_KEEP_RESERVED : 0) == 0;
+        if (ok && in_arena)
+            arena_mark((void *)baseAddr, len, 0);
+        return ok;
+    }
+#endif
     if (arena_release((void *)baseAddr, len, &ok))
         return ok;
     return munmap((void *)baseAddr, len) == 0;
@@ -2380,6 +2712,12 @@ BOOL GlobalMemoryStatusEx(LPMEMORYSTATUSEX b)
     b->ullAvailPhys     = avail;
     b->ullTotalPageFile = b->ullTotalPhys + (ULONGLONG)swap.xsu_total;
     b->ullAvailPageFile = b->ullAvailPhys + (ULONGLONG)swap.xsu_avail;
+#elif defined(__FreeBSD__)
+    /* [ps5 port] What a homebrew app may count on, not the console's total. */
+    b->ullTotalPhys     = 2048ull << 20;
+    b->ullAvailPhys     = 1024ull << 20;
+    b->ullTotalPageFile = b->ullTotalPhys;
+    b->ullAvailPageFile = b->ullAvailPhys;
 #else
     struct sysinfo si;
     if (sysinfo(&si) != 0) return FALSE;

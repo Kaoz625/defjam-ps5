@@ -18,6 +18,9 @@
 #if defined(_WIN32)
 #include <intrin.h>
 #endif
+#if defined(__PROSPERO__)
+#include <unistd.h>     /* usleep */
+#endif
 #if defined(_MSC_VER) && !defined(__clang__)
 #pragma intrinsic(_ReturnAddress)
 #define IRQL_CALLER() _ReturnAddress()
@@ -273,6 +276,16 @@ int xbox_DispatchLockEnter(void)
     for (tries = 0; tries < 2000; tries++) {        /* about 200 ms */
         if (TryEnterCriticalSection(&g_dispatch_cs))
             return 1;
+#if defined(__PROSPERO__)
+        /* [ps5 port] The DPC runner outranks the title on its one CPU, so a
+         * yield never reaches the title thread holding the lock: sleep, so
+         * that it can run and lower. About 0.1 ms a try here. */
+        if (tries < 8)
+            SwitchToThread();
+        else
+            usleep(50);
+        continue;
+#endif
         if (tries < 50)
             SwitchToThread();
         else
@@ -1198,11 +1211,17 @@ uint64_t xbox_ReadTimeStampCounter(void)
     static LARGE_INTEGER origin;
     LARGE_INTEGER now;
 
-    if (freq.QuadPart == 0) {
-        QueryPerformanceFrequency(&freq);
-        QueryPerformanceCounter(&origin);
-        if (freq.QuadPart == 0)
-            freq.QuadPart = 1;
+    if (InterlockedCompareExchange64((volatile LONGLONG *)&freq.QuadPart, 0, 0) == 0) {
+        /* The origin first, the frequency last: a thread that sees the
+         * frequency set must also see the origin, or it scales the whole
+         * host uptime once. */
+        LARGE_INTEGER f, o;
+        QueryPerformanceFrequency(&f);
+        QueryPerformanceCounter(&o);
+        if (f.QuadPart == 0)
+            f.QuadPart = 1;
+        InterlockedCompareExchange64((volatile LONGLONG *)&origin.QuadPart, o.QuadPart, 0);
+        InterlockedCompareExchange64((volatile LONGLONG *)&freq.QuadPart, f.QuadPart, 0);
     }
     QueryPerformanceCounter(&now);
 

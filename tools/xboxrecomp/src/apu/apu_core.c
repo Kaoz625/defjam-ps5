@@ -580,7 +580,18 @@ static void throttle(MCPXAPUState *d)
         }
     }
     period_base_us = d->next_frame_time_us;
+#if defined(__PROSPERO__)
+    {
+        /* [ps5 port] 256 frames are 5333.33 us, not 5333: carry the third.
+         * At 5333 the mixer made 48003 frames a second, the output ring
+         * filled by 3 a second, and from about eleven minutes in a 21 ms
+         * submission was dropped every six minutes, a click each time. */
+        static unsigned periods;
+        d->next_frame_time_us += EP_FRAME_US + (++periods % 3 == 0);
+    }
+#else
     d->next_frame_time_us += EP_FRAME_US;
+#endif
     /* A pause request cuts the wait short, and a frame thread kept running by
      * the mixer while paused comes back here at once: the deadline then ran
      * ahead of the clock by a period per pass, and the first frame after the

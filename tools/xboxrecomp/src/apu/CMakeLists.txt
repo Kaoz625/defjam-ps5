@@ -42,7 +42,10 @@ if(WIN32)
     target_link_libraries(xbox_apu PRIVATE platform kernel32 winmm xaudio2_8 ole32)
 else()
     # Linux: platform layer (Win32 primitives on POSIX) + SDL2 audio + libm
-    if(XBOXRECOMP_SDL3)
+    if(PS5)
+        # [ps5 port] sceAudioOut, from the PS5 SDK's libSceAudioOut.
+        target_link_libraries(xbox_apu PRIVATE platform SceAudioOut m)
+    elseif(XBOXRECOMP_SDL3)
         find_package(SDL3 REQUIRED CONFIG)
         target_link_libraries(xbox_apu PRIVATE platform SDL3::SDL3 m)
         target_compile_definitions(xbox_apu PRIVATE XBOXRECOMP_HAVE_SDL3=1)

@@ -64,6 +64,9 @@ typedef struct D3D8VkOverlayFrame {
     uint32_t width, height;     /* window pixels */
     int      format;            /* VkFormat of the window's image */
     uint32_t generation;
+    int32_t  picture_x0, picture_y0, picture_x1, picture_y1;  /* where the title's picture is, in window pixels */
+    void    *side_blur;         /* VkImageView: the picture's 4:3 middle blurred (64x48), when asked for; else NULL */
+    uint32_t side_blur_generation;   /* changes when that image is made again */
 } D3D8VkOverlayFrame;
 
 typedef struct D3D8VkOverlay {
@@ -74,6 +77,35 @@ typedef struct D3D8VkOverlay {
 
 /* NULL removes it. Safe to call before the device exists. */
 void d3d8_vk_set_overlay(const D3D8VkOverlay *overlay);
+
+/* From the overlay's active(): blur the picture's 4:3 middle this frame and pass
+ * it to draw() as side_blur, for filling the sides beside a 4:3 menu. */
+void d3d8_vk_request_side_blur(void);
+
+/* A frame generator, the host's: with one set (on a display refreshing at twice
+ * the title's rate), each title frame is shown twice, first as a picture the
+ * generator makes halfway between the previous frame and this one, then as
+ * itself. Handles are Vulkan's as plain pointers. `create` is called when the
+ * picture's size is known (and again after `destroy` if it changes) and says
+ * whether the generator is ready. `generate` records into `command_buffer`:
+ * `prev` and `next` are R8G8B8A8 views in SHADER_READ_ONLY_OPTIMAL, `out` an
+ * R8G8B8A8 storage view in GENERAL, and the backend makes every barrier around
+ * the call. NULL removes it; call before the first frame. */
+typedef struct D3D8VkFrameGen {
+    int  (*create)(void *user, void *device, void *physical_device, uint32_t width, uint32_t height);
+    void (*generate)(void *user, void *command_buffer, void *prev_view, void *next_view, void *out_view, float t);
+    void (*destroy)(void *user);
+    void *user;
+} D3D8VkFrameGen;
+void d3d8_vk_set_frame_generator(const D3D8VkFrameGen *generator);
+/* With a generator set: on (the default) shows the generated pictures; off shows
+ * each title frame once, as without a generator, and lets the generator go. Any
+ * time, any thread; it takes effect at the next present. */
+void d3d8_vk_set_frame_generation(int on);
+
+/* DXT textures kept compressed on the GPU (on, the default, where the device can)
+ * or decoded to R8G8B8A8 (off). Applies to textures made from then on. */
+void d3d8_vk_set_native_bc(int on);
 
 #ifdef __cplusplus
 }

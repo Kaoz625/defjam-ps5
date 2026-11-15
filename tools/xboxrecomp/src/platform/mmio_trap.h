@@ -61,6 +61,17 @@ int       mmio_trap_emulate(void *uctx, uint32_t off, void *dev,
 int       mmio_trap_neighbour(void *uctx, uintptr_t fault);
 uintptr_t mmio_trap_pc(void *uctx);
 
+/* Where the host's own code at pc can be read: pc itself, except on the PS5,
+ * where code pages are execute-only (a read of one ends the process with
+ * SYSTEM_XO_VIOLATION). There it points into a copy of the program's code
+ * loaded with mmio_trap_load_code; outside that copy, at sixteen zero bytes,
+ * which no decoder accepts. */
+const uint8_t *mmio_trap_code(uintptr_t pc);
+
+/* [ps5 port] Load the copy of the code segment ps5/tools/ps5_package.sh
+ * writes beside eboot.bin. Returns 0, or -1 when there is none. */
+int mmio_trap_load_code(const char *path);
+
 /* Accesses completed against the open view because they only shared a host
  * page with a device. A cost to watch on 16 KB hosts; always 0 on 4 KB ones. */
 uint64_t mmio_trap_neighbour_count(void);

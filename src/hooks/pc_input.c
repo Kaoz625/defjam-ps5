@@ -77,6 +77,11 @@ size_t pc_input_settings(RecompSetting *out, size_t max)
     if (max < 64) return 0;
     memset(out, 0, sizeof(*out) * 64);
 
+#if defined(__PROSPERO__)
+#define BUZZ_ON_CONNECT 0       /* [ps5 port] the DualSense is already paired: no buzz at start */
+#else
+#define BUZZ_ON_CONNECT 1
+#endif
 #define ADD(...) do { RecompSetting s_ = { __VA_ARGS__ }; out[n++] = s_; } while (0)
     ADD("input", "keyboard_player", RECOMP_SETTING_ENUM, 0, 0, 0, k_keyboard_player, "RECOMP_KEYBOARD_PLAYER",
         RECOMP_SETTING_RESTART,
@@ -94,7 +99,7 @@ size_t pc_input_settings(RecompSetting *out, size_t max)
     ADD("input", "rumble_min_ms", RECOMP_SETTING_INT, 200, 0, 1000, NULL, NULL, 0,
         "Shortest rumble pulse in milliseconds: the game's pulses are 50-200 ms, which many pads do not make "
         "felt. 0 passes the game's timing through unchanged.");
-    ADD("input", "rumble_on_connect", RECOMP_SETTING_BOOL, 1, 0, 0, NULL, NULL, 0,
+    ADD("input", "rumble_on_connect", RECOMP_SETTING_BOOL, BUZZ_ON_CONNECT, 0, 0, NULL, NULL, 0,
         "Buzz a pad for a moment when it takes a player, so you can tell it works and which one it is.");
     ADD("input", "hide_cursor", RECOMP_SETTING_BOOL, 1, 0, 0, NULL, NULL, 0,
         "Hide the mouse pointer over the game when it has not moved for two seconds.");
@@ -158,7 +163,7 @@ static void build_config(InputHostConfig *cfg)
     cfg->rumble_percent = geti("input", "rumble", 100);
     cfg->rumble_floor = geti("input", "rumble_floor", 60);
     cfg->rumble_min_ms = geti("input", "rumble_min_ms", 200);
-    cfg->rumble_on_connect = geti("input", "rumble_on_connect", 1);
+    cfg->rumble_on_connect = geti("input", "rumble_on_connect", BUZZ_ON_CONNECT);
     /* Diagnostics for unattended runs: no physical pad, and no focus needed. */
     cfg->no_pads = env_on("RECOMP_INPUT_NO_PADS");
     cfg->virtual_pads = getenv("RECOMP_INPUT_VIRTUAL_PADS") ? atoi(getenv("RECOMP_INPUT_VIRTUAL_PADS")) : 0;
@@ -166,8 +171,17 @@ static void build_config(InputHostConfig *cfg)
     cfg->virtual_chord_ms = getenv("RECOMP_INPUT_VIRTUAL_CHORD_MS") ? atoi(getenv("RECOMP_INPUT_VIRTUAL_CHORD_MS")) : 0;
     cfg->ignore_focus = env_on("RECOMP_INPUT_IGNORE_FOCUS");
 
-    cfg->padmap.deadzone_left = (uint8_t)geti("gamepad", "left_deadzone", 15);
-    cfg->padmap.deadzone_right = (uint8_t)geti("gamepad", "right_deadzone", 15);
+    cfg->padmap.deadzone_left = (uint8_t)geti("gamepad", "left_deadzone", cfg->padmap.deadzone_left);
+    cfg->padmap.deadzone_right = (uint8_t)geti("gamepad", "right_deadzone", cfg->padmap.deadzone_right);
+#if defined(__PROSPERO__)
+    /* [ps5 port] 15 was the default before the console's became 0 (the title
+     * has its own dead zone; input_map.c). A settings.ini written by an
+     * earlier build still says 15: read that as "the default". */
+    if (cfg->padmap.deadzone_left == 15)
+        cfg->padmap.deadzone_left = 0;
+    if (cfg->padmap.deadzone_right == 15)
+        cfg->padmap.deadzone_right = 0;
+#endif
     cfg->padmap.trigger_threshold = (uint8_t)geti("gamepad", "trigger_threshold", 5);
     cfg->padmap.button_threshold = (uint8_t)geti("gamepad", "button_threshold", 50);
     cfg->padmap.left_stick = (uint8_t)geti("gamepad", "left_stick", INPUT_STICK_LEFT);

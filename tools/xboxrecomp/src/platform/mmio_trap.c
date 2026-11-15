@@ -14,6 +14,7 @@
 
 #include <errno.h>
 #include <signal.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -49,6 +50,17 @@ static volatile uint64_t g_neighbours;
 static struct sigaction g_prev_segv, g_prev_bus;
 
 uint64_t mmio_trap_neighbour_count(void) { return g_neighbours; }
+
+/* [ps5 port] Every fault this handler sees, and the last few addresses, for a
+ * port's heartbeat line: a trap on a hot path costs a signal per access. */
+static volatile uint64_t g_faults;
+static volatile uintptr_t g_last_fault[8], g_last_fault_pc[8];
+uint64_t mmio_trap_fault_count(void) { return g_faults; }
+void mmio_trap_last_faults(uintptr_t addr[8], uintptr_t pc[8])
+{
+    int i;
+    for (i = 0; i < 8; i++) { addr[i] = g_last_fault[i]; pc[i] = g_last_fault_pc[i]; }
+}
 
 /* ── A64 loads and stores ──────────────────────────────────────────────── */
 
@@ -332,6 +344,7 @@ struct x64_context {
     uint32_t EFlags;
 };
 #define MMIO_X64_CONTEXT struct x64_context
+#define MMIO_CODE_PTR(rip) mmio_trap_code((uintptr_t)(rip))
 #define mmio_emulate mmio_x64_emulate
 #include "mmio_decode.h"
 #undef mmio_emulate
@@ -345,6 +358,23 @@ struct x64_context {
     X(R12, UC_R(uc, r12)) X(R13, UC_R(uc, r13)) X(R14, UC_R(uc, r14)) X(R15, UC_R(uc, r15)) \
     X(Rip, UC_R(uc, rip))
 #define UC_FLAGS(uc) UC_R(uc, rflags)
+#elif defined(__PROSPERO__)
+/* [ps5 port] The PS5 kernel hands a signal handler FreeBSD's amd64 ucontext
+ * with 48 extra bytes in front of it: mcontext starts 64 bytes in, not 16
+ * where the SDK's header puts it (measured on a 13.60 console by the FIFA
+ * Street port: rdi at +72, rax at +120, rip at +224). Read it as 64-bit
+ * slots of FreeBSD's struct __mcontext. */
+enum { PS5_RDI = 1, PS5_RSI = 2, PS5_RDX = 3, PS5_RCX = 4, PS5_R8 = 5, PS5_R9 = 6,
+       PS5_RAX = 7, PS5_RBX = 8, PS5_RBP = 9, PS5_R10 = 10, PS5_R11 = 11, PS5_R12 = 12,
+       PS5_R13 = 13, PS5_R14 = 14, PS5_R15 = 15, PS5_RIP = 20, PS5_EFL = 22, PS5_RSP = 23 };
+#define UC_G(uc, name) (((uint64_t *)((uint8_t *)(uc) + 64))[PS5_##name])
+#define X64_REGS(X) \
+    X(Rax, UC_G(uc, RAX)) X(Rcx, UC_G(uc, RCX)) X(Rdx, UC_G(uc, RDX)) X(Rbx, UC_G(uc, RBX)) \
+    X(Rsp, UC_G(uc, RSP)) X(Rbp, UC_G(uc, RBP)) X(Rsi, UC_G(uc, RSI)) X(Rdi, UC_G(uc, RDI)) \
+    X(R8,  UC_G(uc, R8))  X(R9,  UC_G(uc, R9))  X(R10, UC_G(uc, R10)) X(R11, UC_G(uc, R11)) \
+    X(R12, UC_G(uc, R12)) X(R13, UC_G(uc, R13)) X(R14, UC_G(uc, R14)) X(R15, UC_G(uc, R15)) \
+    X(Rip, UC_G(uc, RIP))
+#define UC_FLAGS(uc) UC_G(uc, EFL)
 #else
 #define UC_G(uc, name) ((uc)->uc_mcontext.gregs[REG_##name])
 #define X64_REGS(X) \
@@ -377,8 +407,23 @@ int mmio_trap_emulate(void *uctx, uint32_t off, void *dev,
     return ok;
 }
 
-/* An x86-64 host has the console's page size, so a closed range has no
- * neighbours and a fault is either on a device with callbacks or not ours. */
+/* Plain memory for a neighbour: the open view of the span is the device. */
+static uint64_t mem_read(void *dev, uint32_t off, int size)
+{
+    uint64_t v = 0;
+    memcpy(&v, (uint8_t *)dev + off, (size_t)size);
+    return v;
+}
+
+static void mem_write(void *dev, uint32_t off, uint64_t val, int size)
+{
+    memcpy((uint8_t *)dev + off, &val, (size_t)size);
+}
+
+/* A fault is on a device with callbacks, or -- where the host page is larger
+ * than the console's 4 KB (16 KB on the PS5) -- on memory that only shares a
+ * closed host page with one, completed against the span's open view. On a
+ * 4 KB host a closed range has no neighbours. */
 static int service(ucontext_t *uc, uintptr_t fault, int devices)
 {
     int i, n = g_trap_count;
@@ -387,6 +432,16 @@ static int service(ucontext_t *uc, uintptr_t fault, int devices)
         mmio_trap *d = &g_traps[i];
         if (d->len && d->rd && fault >= d->addr && fault < d->addr + d->len)
             return mmio_trap_emulate(uc, (uint32_t)(fault - d->addr), d->dev, d->rd, d->wr);
+    }
+    for (i = 0; i < n; i++) {
+        mmio_trap *t = &g_traps[i];
+        if (t->len && t->open && fault >= t->span && fault < t->span + t->span_len
+                && !(t->rd && fault >= t->addr && fault < t->addr + t->len)) {
+            int ok = mmio_trap_emulate(uc, (uint32_t)(fault - t->span), t->open,
+                                       mem_read, mem_write);
+            g_neighbours += ok != 0;
+            return ok;
+        }
     }
     return 0;
 }
@@ -437,6 +492,11 @@ static void on_fault(int sig, siginfo_t *si, void *ctx)
 {
     int saved = errno;
 
+    {
+        uint64_t n = __atomic_fetch_add(&g_faults, 1, __ATOMIC_RELAXED);
+        g_last_fault[n & 7] = (uintptr_t)si->si_addr;
+        g_last_fault_pc[n & 7] = mmio_trap_pc(ctx);
+    }
     if (!service((ucontext_t *)ctx, (uintptr_t)si->si_addr, 1))
         chain(sig == SIGBUS ? &g_prev_bus : &g_prev_segv, sig, si, ctx);
     errno = saved;
@@ -476,6 +536,24 @@ static uint8_t *open_view(uintptr_t span, uintptr_t span_len)
         return NULL;
     }
     return (uint8_t *)(uintptr_t)at;
+#elif defined(__PROSPERO__)
+    /* [ps5 port] The PS5 cannot alias private memory (no mremap, no
+     * mach_vm_remap). Its pages are 16 KB, so closing a device's 4 KB closes
+     * neighbours too: keep the span's contents in a copy instead. Once the
+     * span is closed every access to it faults, and the neighbours' are
+     * completed against this copy (service above), as are the host's bulk
+     * copies (mmio_trap_view). Traps on the same span share one copy; the
+     * last one removed writes it back. */
+    int i, n = g_trap_count;
+    uint8_t *copy;
+    for (i = 0; i < n; i++)
+        if (g_traps[i].len && g_traps[i].open && g_traps[i].span == span
+                && g_traps[i].span_len == span_len)
+            return g_traps[i].open;
+    copy = malloc(span_len);
+    if (copy)
+        memcpy(copy, (void *)span, span_len);
+    return copy;
 #else
     /* Linux can only alias a shared mapping this way (mremap with a zero old
      * size); a private one fails and the caller reports it. */
@@ -562,8 +640,20 @@ int mmio_trap_remove(void *addr)
             if (mprotect((void *)t->span, t->span_len, PROT_READ | PROT_WRITE))
                 return -1;
             t->len = 0;
+#if defined(__PROSPERO__)
+            if (t->open) {
+                int shared = 0;
+                for (j = 0; j < n; j++)
+                    shared |= g_traps[j].len && g_traps[j].open == t->open;
+                if (!shared) {
+                    memcpy((void *)t->span, t->open, t->span_len);
+                    free(t->open);
+                }
+            }
+#else
             if (t->open)
                 munmap(t->open, t->span_len);
+#endif
             t->open = NULL;
             /* A device that shares a host page with this one stays closed. */
             for (j = 0; j < n; j++)
@@ -575,5 +665,56 @@ int mmio_trap_remove(void *addr)
     errno = ENOENT;
     return -1;
 }
+
+/* ── The code as data ──────────────────────────────────────────────────── */
+
+#if defined(__PROSPERO__)
+#include <stdio.h>
+
+/* code.bin: "DJCB", then the code segment's link address, the link address
+ * of mmio_trap_code (which says how far the loader moved the program), its
+ * length, and the bytes. */
+static const uint8_t *g_code;
+static uintptr_t      g_code_lo, g_code_hi;
+
+int mmio_trap_load_code(const char *path)
+{
+    struct { char magic[4]; uint32_t pad; uint64_t vaddr, anchor, size; } h;
+    FILE *f = fopen(path, "rb");
+    uint8_t *bytes;
+    intptr_t slide;
+
+    if (!f)
+        return -1;
+    if (fread(&h, sizeof h, 1, f) != 1 || memcmp(h.magic, "DJCB", 4) || !h.size
+            || !(bytes = malloc((size_t)h.size))) {
+        fclose(f);
+        return -1;
+    }
+    if (fread(bytes, 1, (size_t)h.size, f) != (size_t)h.size) {
+        free(bytes);
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+    slide = (intptr_t)(uintptr_t)&mmio_trap_code - (intptr_t)h.anchor;
+    g_code_lo = (uintptr_t)(h.vaddr + slide);
+    g_code_hi = g_code_lo + (uintptr_t)h.size;
+    __atomic_store_n(&g_code, bytes, __ATOMIC_RELEASE);
+    return 0;
+}
+
+const uint8_t *mmio_trap_code(uintptr_t pc)
+{
+    static const uint8_t none[32];
+    const uint8_t *code = __atomic_load_n(&g_code, __ATOMIC_ACQUIRE);
+    if (code && pc >= g_code_lo && pc + 16 <= g_code_hi)
+        return code + (pc - g_code_lo);
+    return none;
+}
+#else
+int mmio_trap_load_code(const char *path) { (void)path; return 0; }
+const uint8_t *mmio_trap_code(uintptr_t pc) { return (const uint8_t *)pc; }
+#endif
 
 #endif /* !_WIN32 */

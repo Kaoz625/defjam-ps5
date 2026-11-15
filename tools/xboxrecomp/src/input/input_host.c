@@ -892,8 +892,10 @@ void xbox_HostInputScriptVirtual(int slot, const uint8_t *held)
     if (!joy) return;
     for (c = 0; c < 16; c++)
         if (buttons[c] >= 0) SDL_SetJoystickVirtualButton(joy, buttons[c], held[c] != 0);
-    SDL_SetJoystickVirtualAxis(joy, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, held[INPUT_LEFT_TRIGGER] ? 32767 : 0);
-    SDL_SetJoystickVirtualAxis(joy, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, held[INPUT_RIGHT_TRIGGER] ? 32767 : 0);
+    /* A virtual trigger is released at the bottom of the axis, not at 0 (SDL
+     * maps the whole range onto 0..32767, so 0 reads as half pulled). */
+    SDL_SetJoystickVirtualAxis(joy, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, held[INPUT_LEFT_TRIGGER] ? 32767 : -32768);
+    SDL_SetJoystickVirtualAxis(joy, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, held[INPUT_RIGHT_TRIGGER] ? 32767 : -32768);
     /* SDL's Y axes point down. */
     v = (held[INPUT_LSTICK_RIGHT] ? 32767 : 0) - (held[INPUT_LSTICK_LEFT] ? 32767 : 0);
     SDL_SetJoystickVirtualAxis(joy, SDL_GAMEPAD_AXIS_LEFTX, (Sint16)v);

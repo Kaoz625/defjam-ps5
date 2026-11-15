@@ -1683,23 +1683,46 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                  * in its device struct rather than assuming 0xFD800000, and
                  * mirroring the wrong block leaves it spinning on a GET that
                  * never moves. */
+#if defined(__PROSPERO__)
+                /* [ps5 port] Not on the console: this thread runs the push
+                 * buffer, and a line and a flush on every PUT -- about a hundred
+                 * a second -- held the GPU's work behind the log file, which
+                 * the PS5 writes slowly and every few seconds stalls on for a
+                 * third of a second: the game stuttered with it. */
+                if (s_nv2a_trace && getenv("RECOMP_NV2A_PUT_LOG")) {
+#else
                 if (s_nv2a_trace) {
+#endif
                     uint32_t g = *(volatile uint32_t *)
                                  ((char *)regs + NV2A_USER_DMA_GET);
                     fprintf(stderr, "  [NV2A] DMA_PUT = 0x%08X  DMA_GET = "
                             "0x%08X%s\n", put, g,
                             g == put ? "" : "  (GPU behind)");
                 }
+#if !defined(__PROSPERO__)
                 fflush(stderr);
+#endif
             }
         }
         if (s_nv2a_trace) {
             static uint32_t last_start = 0xFFFFFFFFu;
             uint32_t start = xbox_Nv2aRegRead(0xFD600800u);   /* may be trapped */
             if (start != last_start) {
+#if defined(__PROSPERO__)
+                /* [ps5 port] Two buffers swap on every flip: the first
+                 * twenty, then one in a thousand. */
+                static unsigned flips;
+                int say = flips < 20 || flips % 1000 == 0;
+                flips++;
+#else
+                int say = 1;
+#endif
                 last_start = start;
+                if (say)
                 fprintf(stderr, "  [NV2A] PCRTC_START = 0x%08X\n", start);
+#if !defined(__PROSPERO__)
                 fflush(stderr);
+#endif
             }
         }
 
@@ -2070,6 +2093,16 @@ static int peek_readable(uint32_t va)
     return 0;
 }
 
+/* The same check for host code that samples guest state (the PS5 port's
+ * game watch): 1 and the dword at va, or 0 when va is in no mapped window. */
+int xbox_PeekRead32(uint32_t va, uint32_t *out)
+{
+    if (g_memory_base == NULL || !peek_readable(va))
+        return 0;
+    *out = *(const volatile uint32_t *)((const uint8_t *)g_memory_offset + va);
+    return 1;
+}
+
 /* ---- RECOMP_WATCH: name the guest code that changes a guest dword -------
  *
  * A peek says a value changed between two samples. It does not say who
@@ -2417,7 +2450,7 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
         fprintf(stderr, "    GS %08X %08X\n", a,
                 *(const uint32_t *)(mem + a));
     }
-    fflush(stderr);
+    (fflush)(stderr);   /* the real one: _exit does not flush, and the PS5 build quiets fflush */
     _exit(3);
     return 0;
 }
@@ -2525,11 +2558,15 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      */
     {
         static const uintptr_t try_bases[] = {
+#if !defined(__PROSPERO__)
+            /* [ps5 port] none of these on the PS5: the program itself is
+             * loaded at 0x400000, and a fixed map here would land on it */
             XBOX_BASE_ADDRESS,      /* 0x00010000 - original Xbox address */
             0x00800000,             /* 8 MB - above typical PEB/TEB region */
             0x01000000,             /* 16 MB */
             0x02000000,             /* 32 MB */
             0x10000000,             /* 256 MB */
+#endif
             0,                      /* sentinel - let OS choose */
         };
 
@@ -2554,7 +2591,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * this on Windows needs placeholder reservations (VirtualAlloc2). */
 #ifndef _WIN32
         g_span_size = g_memory_size * (size_t)(1 + XBOX_NUM_MIRRORS);
-#if defined(__linux__)
+#if defined(__linux__) || defined(__PROSPERO__)
         /* Linux places mappings top-down, so whatever sits just above an
          * OS-chosen span belongs to libraries and earlier allocations -- the
          * contiguous window (base + 0x80000000) failed on every Steam Deck
@@ -2566,7 +2603,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             g_span_size = (size_t)(0x100000000ULL - XBOX_MAP_START);
 #endif
         g_span_base = VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
-#if defined(__linux__)
+#if defined(__linux__) || defined(__PROSPERO__)
         if (g_span_base && !win32_reserve_arena(g_span_base, g_span_size)) {
             VirtualFree(g_span_base, g_span_size, MEM_RELEASE);
             g_span_base = NULL;

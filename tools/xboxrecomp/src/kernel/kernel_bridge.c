@@ -31,6 +31,10 @@
 #endif
 #include <sched.h>
 #endif
+#if defined(__PROSPERO__)
+#include <pthread.h>
+#include <sched.h>
+#endif
 #include "kernel.h"
 #include "guest_vmem.h"
 #include "xbox_memory_layout.h"
@@ -380,6 +384,7 @@ static unsigned long long g_ordinal_calls[XBOX_KERNEL_THUNK_TABLE_SIZE];
  * "count <= log budget" turned true, and every kernel call then wrote two log
  * lines through the shared stderr lock -- the frame rate fell to ~1 FPS. */
 static long long g_kernel_call_count = 0;
+long long xbox_kernel_call_count(void) { return g_kernel_call_count; }
 
 /* How many kernel calls get logged before the log goes quiet.
  *
@@ -550,6 +555,105 @@ void xbox_PinToGuestCore(void)
         CPU_SET(cpu, &set);
         sched_setaffinity(0, sizeof set, &set);
     }
+#elif defined(__PROSPERO__)
+    /* [ps5 port] The PS5 pins threads like Linux, through Sony's 64-bit CPU
+     * mask (the SDK's FreeBSD cpuset_t is larger than the console's, and
+     * pthread_getaffinity_np refuses it with ERANGE). The token below kept the
+     * CPU with a thread sitting in a system call for 200-480 ms at a time (it
+     * can only hand over at a checkpoint here, with no guest code range), and
+     * the game crawled on a black screen. If the pin is refused, the token is
+     * still there. */
+    static volatile LONG init;
+    static int cpu = -1, spread;
+    extern void *scePthreadSelf(void);
+    extern int scePthreadGetaffinity(void *thread, uint64_t *mask);
+    extern int scePthreadSetaffinity(void *thread, uint64_t mask);
+
+    if (InterlockedCompareExchange(&init, 1, 0) == 0) {
+        const char *s = getenv("RECOMP_GUEST_CORES");
+        spread = s && !strcmp(s, "all");
+        if (!spread) {
+            extern volatile int g_ps5_guest_cpu;
+            extern volatile uint64_t g_ps5_host_cpu_mask;
+            uint64_t mask = 0;
+            int e;
+            if (g_ps5_guest_cpu >= 0) {
+                /* Chosen by the host before its threads started, and the
+                 * calling thread may already be on the host CPUs only. */
+                e = 0;
+                mask = g_ps5_host_cpu_mask | (1ull << g_ps5_guest_cpu);
+            } else {
+                e = scePthreadGetaffinity(scePthreadSelf(), &mask);
+            }
+            if (e == 0 && mask) {
+                int i;
+                if (g_ps5_guest_cpu >= 0)
+                    cpu = g_ps5_guest_cpu;
+                else if (mask & (1ull << 2))
+                    cpu = 2;
+                else
+                    for (i = 0; i < 64 && cpu < 0; i++)
+                        if (mask & (1ull << i))
+                            cpu = i;
+                fprintf(stderr, "  [KERNEL] CPU mask 0x%llX\n", (unsigned long long)mask);
+            } else {
+                fprintf(stderr, "  [KERNEL] could not read the CPU mask (0x%08X)\n", (unsigned)e);
+            }
+            if (cpu >= 0) {
+                if (mask & ~(1ull << cpu))
+                    g_ps5_host_cpu_mask = mask & ~(1ull << cpu);
+                e = scePthreadSetaffinity(scePthreadSelf(), 1ull << cpu);
+                if (e) {
+                    fprintf(stderr, "  [KERNEL] pinning to CPU %d failed (0x%08X)\n", cpu, (unsigned)e);
+                    cpu = -1;
+                }
+            }
+            {
+                int pol = -1;
+                struct sched_param sp;
+                memset(&sp, 0, sizeof sp);
+                pthread_getschedparam(pthread_self(), &pol, &sp);
+                fprintf(stderr, "  [KERNEL] scheduling policy %d, priority %d\n",
+                        pol, sp.sched_priority);
+            }
+            if (cpu >= 0)
+                fprintf(stderr, "  [KERNEL] guest threads share host CPU %d"
+                                " (RECOMP_GUEST_CORES=all to spread them)\n", cpu);
+            else
+                fprintf(stderr, "  [KERNEL] guest threads take turns on one guest CPU\n");
+        }
+        InterlockedExchange(&init, 2);
+    }
+    while (init != 2)
+        YieldProcessor();
+    {   /* The port samples where guest threads spend their time. */
+        extern void ps5_guest_thread_register(void) __attribute__((weak));
+        if (ps5_guest_thread_register)
+            ps5_guest_thread_register();
+    }
+    if (cpu >= 0) {
+        /* Round robin, not the console's default first-in-first-out: on one
+         * CPU a FIFO thread that spins waiting for another guest thread (the
+         * GPU's fence, a flag the timer thread sets) never lets that thread
+         * run again, and the game stops on a black screen. Windows and Linux
+         * slice the CPU between them; RR does that here. */
+        struct sched_param sp;
+        int pol = 0, e;
+        static volatile LONG told;
+        memset(&sp, 0, sizeof sp);
+        pthread_getschedparam(pthread_self(), &pol, &sp);
+        /* The title's level, whoever created the thread (a thread inherits
+         * its creator's priority: 636 from the interrupt thread), unless
+         * it was already made time-critical (668) before it got here. */
+        if (sp.sched_priority != 668)
+            sp.sched_priority = 700;
+        e = pthread_setschedparam(pthread_self(), SCHED_RR, &sp);
+        if (InterlockedIncrement(&told) <= 2)
+            fprintf(stderr, "  [KERNEL] guest thread scheduling: round robin at priority %d (%s)\n",
+                    sp.sched_priority, e ? "refused" : "ok");
+        scePthreadSetaffinity(scePthreadSelf(), 1ull << cpu);
+    } else if (!spread)
+        guest_turn_join();
 #else
     /* Darwin on Apple Silicon has no thread affinity. The same rule is kept
      * with a token instead: one joined thread runs at a time, and a waiting
@@ -3138,6 +3242,26 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
      * very DPC whose acknowledgement lets the GPU reach that fence. It sleeps
      * between ticks, so it takes the CPU only when there is work. */
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+#if defined(__PROSPERO__)
+    {
+        /* [ps5 port] SetThreadPriority only records the priority, so on the
+         * PS5 this thread queued behind the very title threads spinning for
+         * it on their one CPU: a test run spent 175 of its 180 seconds with
+         * the title held for the GPU's interrupt, 9 ms a time. A higher real
+         * priority (lower number on the PS5) lets it preempt them as an
+         * interrupt does on the console. It sleeps between ticks. */
+        struct sched_param sp;
+        int pol = 0, e;
+        memset(&sp, 0, sizeof sp);
+        pthread_getschedparam(pthread_self(), &pol, &sp);
+        /* 64 above the title's 700 (the console's default), whatever the
+         * TIME_CRITICAL request above already set (668, win32_compat.c). */
+        sp.sched_priority = 700 - 64;
+        e = pthread_setschedparam(pthread_self(), SCHED_RR, &sp);
+        fprintf(stderr, "  [KERNEL] interrupt thread priority %d (%s)\n",
+                sp.sched_priority, e ? "refused" : "ok");
+    }
+#endif
     {
         extern void xbox_IrqlInterruptThread(void);
         xbox_IrqlInterruptThread();
@@ -3213,12 +3337,18 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         {
             /* Logs are buffered (the port sets that up); push them out once a
              * second so a run that is killed or hangs still shows its tail. */
+#if !defined(__PROSPERO__)
             static long long last_flush;
             if (now - last_flush >= 1000) {
                 last_flush = now;
                 fflush(stdout);
                 fflush(stderr);
             }
+#endif
+            /* [ps5 port] Not on this thread on the PS5: it runs on the
+             * title's CPU above the title's priority, a flush there takes a
+             * millisecond and now and then 0.3 s, and the frame clock and the
+             * title waited behind it. The port's flush thread does it. */
         }
 
         for (i = 0; i < XBOX_MAX_TIMERS; i++) {
@@ -4103,6 +4233,15 @@ static void bridge_NtReadFile(void)
     /* What a read actually delivered. A decoder that rejects its input cannot
      * say whether the bytes were wrong or the read was, and the two look
      * identical from inside the title -- the first bytes settle it. */
+#if defined(__PROSPERO__)
+    /* [ps5 port] A line and a flush per read cost the streaming thread 8% of
+     * its time and a scene load thousands of flushes: on the console only
+     * with RECOMP_READ_LOG=1. */
+    static int read_log = -1;
+    if (read_log < 0)
+        read_log = getenv("RECOMP_READ_LOG") && *getenv("RECOMP_READ_LOG") == '1';
+    if (read_log)
+#endif
     {
         const uint8_t *p = (const uint8_t *)XBOX_TO_NATIVE(buffer_va);
         uint32_t got = (uint32_t)ios.Information;
@@ -10442,6 +10581,17 @@ static void kernel_gpu_preempt(void)
     }
     if (!on || !(kernel_nv2a_swm_waiting() || kernel_gpu_behind(0)) || !xbox_IrqlPreemptible())
         return;
+#if defined(__PROSPERO__)
+    {
+        /* [ps5 port] Not the title's time-critical audio writer: it refills
+         * a ring about 20 ms deep and this hold can last 50; and at its
+         * priority (668) the yields below would never give the title's CPU
+         * to anyone else. */
+        extern int w32_thread_is_urgent(void);
+        if (w32_thread_is_urgent())
+            return;
+    }
+#endif
     QueryPerformanceCounter(&t0);
     QueryPerformanceFrequency(&f);
     if (t0.QuadPart < pause_until)

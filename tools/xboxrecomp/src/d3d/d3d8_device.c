@@ -196,6 +196,8 @@ UINT                 d3d8_GetRenderScale(void) { return g_device_state.render_sc
 static float g_place_kx = 1.0f, g_place_bx = 0.0f;
 void d3d8_SetDrawPlacement(float kx, float bx) { g_place_kx = kx; g_place_bx = bx; }
 void d3d8_GetDrawPlacement(float *kx, float *bx) { *kx = g_place_kx; *bx = g_place_bx; }
+/* Placement in y is drawn by the Vulkan renderer only so far. */
+void d3d8_SetDrawPlacementY(float ky, float by) { (void)ky; (void)by; }
 float d3d8_GetCanvasScaleX(void)
 {
     return g_device_state.logical_width ? (float)g_device_state.width / (float)g_device_state.logical_width

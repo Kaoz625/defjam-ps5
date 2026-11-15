@@ -742,6 +742,9 @@ static volatile int s_ws_side_fill = 1;
 static volatile uint32_t s_ws_hud_flip = 0xFFFFFFF0u;
 static volatile int s_ws_hud_bottom;     /* 3-4 fighters: HUD blocks in the bottom corners too */
 static int s_ws_frame_3d, s_ws_frame_pic;  /* this frame drew 3D / centred a full-screen picture */
+static int s_ws_frame_any, s_ws_frame_wide; /* this frame drew anything / drew into the side areas */
+static int s_ws_frame_probes;               /* 3D batches looked at for that this frame */
+static volatile uint32_t s_ws_boxed_run, s_ws_wide_run;
 static uint32_t s_ws_counts[6];
 
 void nv2a_ws_configure(float k, float hud_reach)
@@ -753,6 +756,13 @@ void nv2a_ws_configure(float k, float hud_reach)
 /* 1: a full-screen picture that is centred (movie, poster) gets a blurred
  * extension beside it at present; 0: black. */
 void nv2a_ws_set_side_fill(int on) { s_ws_side_fill = on ? 1 : 0; }
+
+/* Frames in a row that drew nothing outside the centred 4:3 box (a 2D menu, a
+ * movie, a loading poster), and frames in a row that did (a fight, a cutscene,
+ * a menu over a 3D room). At most one of them is non-zero; both stay 0 while
+ * widescreen is off. For a host that decorates the side areas. */
+uint32_t nv2a_ws_boxed_frames(void) { return s_ws_boxed_run; }
+uint32_t nv2a_ws_wide_frames(void) { return s_ws_wide_run; }
 
 /* Call once per game tick while a fight's HUD is up; bottom_rows when 3 or 4
  * fighters are in the match (their HUD blocks sit in the bottom corners). */
@@ -772,7 +782,17 @@ static void ws_end_frame(void)
         extern void d3d8_RequestSideFill(void);
         d3d8_RequestSideFill();
     }
+    if (s_ws_k < 1.0f && s_ws_frame_any) {
+        if (s_ws_frame_wide) {
+            s_ws_wide_run++;
+            s_ws_boxed_run = 0;
+        } else {
+            s_ws_boxed_run++;
+            s_ws_wide_run = 0;
+        }
+    }
     s_ws_frame_3d = s_ws_frame_pic = 0;
+    s_ws_frame_any = s_ws_frame_wide = s_ws_frame_probes = 0;
 }
 
 static int ws_vertex(int vsh, uint32_t used, uint32_t vi, float out[4])
@@ -851,9 +871,53 @@ static void ws_place_batch(int vsh, uint32_t used, const PgraphReadyVertex *read
     s_ws_counts[cls]++;
     if (cls == 0)
         s_ws_frame_3d = 1;
+    s_ws_frame_any = 1;
+    if (cls == 2 || cls == 3) {
+        s_ws_frame_wide = 1;               /* the HUD at the screen edges */
+    } else if (cls == 0 && !s_ws_frame_wide && ++s_ws_frame_probes > 48) {
+        s_ws_frame_wide = 1;               /* that much 3D all inside the box: call it a scene, and stop paying */
+    } else if (cls == 0 && !s_ws_frame_wide) {
+        /* Does this 3D reach the side areas? A scene does (Hor+ spreads it
+         * over the whole canvas); a sub-view, a head in a menu panel, stays in
+         * the centred box. A few vertices spread through the batch, in screen
+         * space (already divided by w); once one batch reaches out, the frame
+         * is decided and the rest are not looked at. */
+        float lo = 320.0f - 320.0f * k - 2.0f, hi = 320.0f + 320.0f * k + 2.0f;
+        uint32_t step = cnt > 8 ? cnt / 8 : 1, j;
+        for (j = 0; j < cnt; j += step) {
+            if (ready) {
+                p[0] = ready[j].x;
+                p[3] = ready[j].w;
+            } else if (!ws_vertex(vsh, used, s_gpu.idx[j], p)) {
+                break;
+            }
+            if (p[3] > 0.0f && (p[0] < lo || p[0] > hi)) {
+                s_ws_frame_wide = 1;
+                break;
+            }
+        }
+    }
     {
         float bx = cls == 2 ? k - s_ws_reach : cls == 3 ? s_ws_reach - k : 0.0f;
-        if (cls == 1 || cls == 2 || cls == 3) {
+        extern float texture_pack_scale_for(uint32_t address);
+        extern void pgraph_d3d11_set_placement_y(float ky, float by);
+        float grow = cls == 1 && x1 > x0 && s_gpu.texs[0].valid && texture_pack_active()
+                     ? texture_pack_scale_for(s_gpu.texs[0].offset) : 1.0f;
+        if (grow != 1.0f) {
+            /* A pack asks for this picture larger (a logo): around its own centre, so it
+             * keeps moving as the title moves it. x * k + 320 (1 - k + bx) becomes that of
+             * c + (x - c) * grow, and y the same in the title's pixels; nothing clips it to
+             * the 4:3 box, so it may reach into the sides. */
+            float cxp = (x0 + x1) * 0.5f, cyp = (y0 + y1) * 0.5f, kk = k * grow;
+            float bb = (cxp * (1.0f - grow) * k + 320.0f * (1.0f - k)) / 320.0f - 1.0f + kk;
+            pgraph_d3d11_set_placement(kk, bb);
+            pgraph_d3d11_set_placement_y(grow, cyp * (1.0f - grow));
+            pgraph_d3d11_set_surface_clip(0, s_gpu.clip_y, 640, s_gpu.clip_h);   /* the whole canvas */
+        } else
+            pgraph_d3d11_set_placement_y(1.0f, 0.0f);
+        if (grow != 1.0f) {
+            /* placed above */
+        } else if (cls == 1 || cls == 2 || cls == 3) {
             /* Clip the placed batch to where its own clip rectangle lands, so
              * what the title keeps off screen (slide-ins start far outside
              * 0..640) does not show in the new side areas: pixel x becomes
@@ -2882,9 +2946,16 @@ static int pack_sample(void *user, uint32_t x, uint32_t y, uint32_t *argb)
     return sample_tex((const Texture *)user, 0, x, y, argb);
 }
 
+static int text_veto(const RecompTextureSource *s, RecompTextureSample sample, void *user);
+
 static int try_texture_pack(const Texture *t, const uint8_t *mem)
 {
     RecompTextureSource source={0};
+    static int veto_set;
+    if (!veto_set) {
+        veto_set = 1;
+        texture_pack_set_veto(text_veto);
+    }
     uint32_t block=d3d8_format_dxt_block_bytes(t->color), bpp=d3d8_format_bpp(t->color)/8;
     uint64_t bytes;
     if (!texture_pack_active() || !t->valid || t->cube || surf_holds_texture(t->offset) ||
@@ -2909,6 +2980,150 @@ static int try_texture_pack(const Texture *t, const uint8_t *mem)
     return pgraph_d3d11_try_texture_pack(&source,pack_sample,(void *)t);
 }
 
+/* Sharper text. The title draws its text into small palettised textures at the
+ * console's resolution (glyph coverage in alpha, one colour), and a 4K picture
+ * stretches them four times over, which blurs every letter. A texture that
+ * looks like that is enlarged here before upload: premultiplied Catmull-Rom,
+ * then the coverage pushed towards its edge (a smoothstep around one half),
+ * which gives letters close to text rasterised at the larger size. Pictures
+ * (more than one colour, or nothing partly transparent) are left alone.
+ * RECOMP_TEXT_SHARPEN=<scale>, 0 or unset for off. */
+static int text_sharpen_scale(void)
+{
+    static int scale = -1;
+    if (scale < 0) {
+        const char *e = getenv("RECOMP_TEXT_SHARPEN");
+        scale = e ? atoi(e) : 0;
+        if (scale < 2 || scale > 4)
+            scale = 0;
+    }
+    return scale;
+}
+
+/* 1: one colour, straight alpha; 2: one colour, premultiplied; 0: not text. */
+static int text_like(const uint32_t *argb, uint32_t n, uint32_t *base)
+{
+    uint32_t i, partial = 0, solid = 0, best = 0, best_a = 0;
+    int straight = 1, premul = 1;
+
+    for (i = 0; i < n; i++) {
+        uint32_t a = argb[i] >> 24;
+        if (a > best_a) { best_a = a; best = argb[i]; }
+        if (a >= 32 && a < 224) partial++;
+        else if (a >= 224) solid++;
+    }
+    if (best_a < 224 || partial < 8 || solid < 8)
+        return 0;
+    for (i = 0; i < n && (straight || premul); i++) {
+        uint32_t c = argb[i], a = c >> 24, ch;
+        if (a < 32)
+            continue;
+        for (ch = 0; ch < 24; ch += 8) {
+            int v = (int)((c >> ch) & 0xFF), b = (int)((best >> ch) & 0xFF);
+            if (v - b > 6 || b - v > 6)
+                straight = 0;
+            int want = b * (int)a / 255;
+            if (v - want > 10 || want - v > 10)
+                premul = 0;
+        }
+    }
+    *base = best & 0x00FFFFFFu;
+    return straight ? 1 : premul ? 2 : 0;
+}
+
+/* A pack's picture of the title's text is a plain resize of the console's
+ * letters, softer than what text_enlarge makes of them: with sharper text on,
+ * text keeps this path even when a pack has it. */
+static int text_veto(const RecompTextureSource *s, RecompTextureSample sample, void *user)
+{
+    uint32_t n = s->width * s->height, x, y, base, *argb;
+    int kind;
+    if (!text_sharpen_scale() || s->format != NV097_TEXFMT_SZ_I8_A8R8G8B8 || !n || n > 512u * 256u)
+        return 0;
+    argb = (uint32_t *)malloc((size_t)n * 4);
+    if (!argb)
+        return 0;
+    for (y = 0; y < s->height; y++)
+        for (x = 0; x < s->width; x++)
+            if (!sample(user, x, y, &argb[y * s->width + x])) {
+                free(argb);
+                return 0;
+            }
+    kind = text_like(argb, n, &base);
+    free(argb);
+    return kind != 0;
+}
+
+static float cubic_weight(float x)
+{
+    x = x < 0 ? -x : x;
+    if (x < 1.0f) return 1.5f * x * x * x - 2.5f * x * x + 1.0f;
+    if (x < 2.0f) return -0.5f * x * x * x + 2.5f * x * x - 4.0f * x + 2.0f;
+    return 0.0f;
+}
+
+/* The coverage (alpha) of a w x h texture at `scale` times the size, sharpened. */
+static uint32_t *text_enlarge(const uint32_t *argb, uint32_t w, uint32_t h, int scale, int kind, uint32_t base)
+{
+    uint32_t W = w * scale, H = h * scale, x, y;
+    float *row = (float *)malloc((size_t)W * h * sizeof(float));
+    uint32_t *out = (uint32_t *)malloc((size_t)W * H * 4);
+    float wt[4][4];
+    int ph;
+
+    if (!row || !out) {
+        free(row); free(out);
+        return NULL;
+    }
+    for (ph = 0; ph < scale; ph++) {                /* weights per output phase */
+        float f = ((float)ph + 0.5f) / (float)scale - 0.5f, sum = 0;
+        int k;
+        float frac = f - floorf(f);
+        for (k = 0; k < 4; k++) sum += wt[ph][k] = cubic_weight((float)(k - 1) - frac);
+        for (k = 0; k < 4; k++) wt[ph][k] /= sum;
+    }
+    for (y = 0; y < h; y++)                         /* across */
+        for (x = 0; x < W; x++) {
+            int p = (int)(x % (uint32_t)scale), sx = (int)(x / (uint32_t)scale), k;
+            float f = ((float)p + 0.5f) / (float)scale - 0.5f, v = 0;
+            int x0 = sx + (int)floorf(f) - 1;
+            for (k = 0; k < 4; k++) {
+                int xx = x0 + k;
+                if (xx < 0) xx = 0;
+                if (xx >= (int)w) xx = (int)w - 1;
+                v += wt[p][k] * (float)(argb[y * w + (uint32_t)xx] >> 24);
+            }
+            row[y * W + x] = v;
+        }
+    for (y = 0; y < H; y++) {                       /* down, then the edge */
+        int p = (int)(y % (uint32_t)scale), sy = (int)(y / (uint32_t)scale), k;
+        float f = ((float)p + 0.5f) / (float)scale - 0.5f;
+        int y0 = sy + (int)floorf(f) - 1;
+        for (x = 0; x < W; x++) {
+            float v = 0, t;
+            uint32_t a;
+            for (k = 0; k < 4; k++) {
+                int yy = y0 + k;
+                if (yy < 0) yy = 0;
+                if (yy >= (int)h) yy = (int)h - 1;
+                v += wt[p][k] * row[(uint32_t)yy * W + x];
+            }
+            t = (v / 255.0f - 0.28f) / 0.44f;
+            t = t < 0 ? 0 : t > 1 ? 1 : t;
+            a = (uint32_t)(t * t * (3.0f - 2.0f * t) * 255.0f + 0.5f);
+            if (kind == 2) {                        /* premultiplied: colour follows coverage */
+                uint32_t r = ((base >> 16) & 0xFF) * a / 255, g = ((base >> 8) & 0xFF) * a / 255,
+                         b = (base & 0xFF) * a / 255;
+                out[y * W + x] = a << 24 | r << 16 | g << 8 | b;
+            } else {
+                out[y * W + x] = a << 24 | base;
+            }
+        }
+    }
+    free(row);
+    return out;
+}
+
 static void bind_texture_ready(const Texture *t)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
@@ -2917,7 +3132,9 @@ static void bind_texture_ready(const Texture *t)
     static struct {
         uint32_t key, sig;
         ULONGLONG checked_ms;
+        uint32_t scale;             /* uploaded this many times the size (sharper text); 0 or 1 as is */
     } seen[SEEN_MAX];
+    uint32_t scale = 1;
     static int seen_count, seen_next;
     uint32_t key, sig, *argb;
     uint8_t *idx;
@@ -2986,7 +3203,8 @@ static void bind_texture_ready(const Texture *t)
         /* Unchanged: bind by key. No data, because the translator's own
          * change check would read indices where it holds ARGB. */
         if (sig == seen[i].sig
-                && pgraph_d3d11_set_texture_ready(key, NULL, w, h,
+                && pgraph_d3d11_set_texture_ready(key, NULL, w * (seen[i].scale ? seen[i].scale : 1),
+                                                  h * (seen[i].scale ? seen[i].scale : 1),
                                                   NV097_TEXFMT_LU_IMAGE_A8R8G8B8))
             return;
         break;
@@ -3004,7 +3222,31 @@ static void bind_texture_ready(const Texture *t)
     xbox_unswizzle_rect(idx, mem + t->offset, w, h, 1);
     for (i = 0; i < n; i++)
         argb[i] = idx[i] < t->palette_len ? pal[idx[i]] : 0;
-    pgraph_d3d11_replace_texture_ready(key, argb, w, h, NV097_TEXFMT_LU_IMAGE_A8R8G8B8);
+    {
+        int sharpen = text_sharpen_scale(), kind = 0;
+        uint32_t base = 0, *big = NULL;
+        if (sharpen && n <= 512u * 256u && (kind = text_like(argb, n, &base)) != 0)
+            big = text_enlarge(argb, w, h, sharpen, kind, base);
+        if (big) {
+            static unsigned told;
+            pgraph_d3d11_replace_texture_ready(key, big, w * (uint32_t)sharpen, h * (uint32_t)sharpen,
+                                               NV097_TEXFMT_LU_IMAGE_A8R8G8B8);
+            free(big);
+            scale = (uint32_t)sharpen;
+            if (told++ < 12)
+                fprintf(stderr, "  [TEXT] sharpened %ux%u text at 0x%08X (%s, colour %06X) to %ux%u%c",
+                        w, h, t->offset, kind == 1 ? "straight" : "premultiplied", base,
+                        w * scale, h * scale, 10);
+        } else {
+            pgraph_d3d11_replace_texture_ready(key, argb, w, h, NV097_TEXFMT_LU_IMAGE_A8R8G8B8);
+            if (sharpen) {
+                static unsigned skipped;
+                if (skipped++ < 12)
+                    fprintf(stderr, "  [TEXT] %ux%u palettised texture at 0x%08X left as it is%c",
+                            w, h, t->offset, 10);
+            }
+        }
+    }
     {
         /* RECOMP_PAL_DUMP=<texture address>[~<mask>],<file>: the ARGB this path
          * made of that palettised texture, as a BMP -- what is uploaded,
@@ -3060,6 +3302,7 @@ static void bind_texture_ready(const Texture *t)
     }
     seen[slot].sig = sig;
     seen[slot].checked_ms = now;
+    seen[slot].scale = scale;
     {
         static uint32_t expanded;
         if (++expanded % 1000 == 0)
@@ -3100,7 +3343,11 @@ static void draw_primitive(void)
     if (!s_gpu.prim || !s_gpu.idx_count)
         return;
     s_gpu.draws++;
+#if defined(__PROSPERO__)
+    if ((s_gpu.draws % 50000) == 0)     /* [ps5 port] was every 200: once a frame */
+#else
     if ((s_gpu.draws % 200) == 0)
+#endif
         fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
     s_gpu.verts += s_gpu.idx_count;
 

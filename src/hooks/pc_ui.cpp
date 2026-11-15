@@ -137,6 +137,10 @@ static const char *friendly(const char *section, const char *key)
         { "launcher", "skip", "Skip the launcher at start" }, { "ui", "scale", "Text and control size" },
         { "debug", "unlock_all", "Debug - Unlock all Fighters and Venues (Requires Restart)" },
         { "ui", "overlay_pad", "Overlay pad buttons" }, { "ui", "overlay_key", "Overlay key" },
+        { "display", "output_4k", "4K output" }, { "ui", "show_fps", "Frame counter" },
+        { "display", "border", "Border" }, { "display", "sharp_text", "Sharper text" },
+        { "display", "frame_gen", "Frame generation" }, { "textures", "menus", "HD menus" },
+        { "textures", "compress", "Compressed textures" },
     };
     for (const Label &l : labels)
         if (!strcmp(l.section, section) && !strcmp(l.key, key)) return l.text;
@@ -347,6 +351,11 @@ void ui_feed_gamepad()
 // on a large monitor) gets bigger text, so the screen is as easy to read as it is in a window.
 static float g_extra_scale = 1.0f;
 
+// [ps5 port] The menu's heading face (Bebas Neue), and where the body face's capitals sit (their middle, as a
+// fraction of the size: text is centred on it).
+static ImFont *g_font_display;
+static float g_font_body_mid = 0.5f;
+
 static float display_scale(UiWindow window)
 {
     float dpi = g_extra_scale;
@@ -375,6 +384,28 @@ void ui_apply_scale(UiWindow window)
     applied = s;
     style = ImGuiStyle();
     ImGui::StyleColorsDark();
+#if defined(__PROSPERO__)
+    // [ps5 port] Near-black panel, white type, the logo's red (pc_ui_ps5.inc draws the rest).
+    style.WindowRounding = 10.0f;
+    style.WindowBorderSize = 1.0f;
+    style.WindowPadding = ImVec2(30, 22);
+    style.ItemSpacing = ImVec2(10, 3);
+    style.ScrollbarSize = 5.0f;
+    style.ScrollbarRounding = 3.0f;
+    style.Colors[ImGuiCol_WindowBg] = ImVec4(0.035f, 0.035f, 0.04f, 0.95f);
+    style.Colors[ImGuiCol_ChildBg] = ImVec4(0, 0, 0, 0);
+    style.Colors[ImGuiCol_Border] = ImVec4(1, 1, 1, 0.08f);
+    style.Colors[ImGuiCol_Text] = ImVec4(0.94f, 0.94f, 0.94f, 1.0f);
+    style.Colors[ImGuiCol_TextDisabled] = ImVec4(0.54f, 0.54f, 0.57f, 1.0f);
+    style.Colors[ImGuiCol_ScrollbarBg] = ImVec4(0, 0, 0, 0);
+    style.Colors[ImGuiCol_ScrollbarGrab] = ImVec4(1, 1, 1, 0.14f);
+    style.Colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(1, 1, 1, 0.22f);
+    style.Colors[ImGuiCol_ScrollbarGrabActive] = ImVec4(1, 1, 1, 0.3f);
+    style.Colors[ImGuiCol_NavCursor] = ImVec4(0.886f, 0.118f, 0.149f, 1.0f);
+    style.ScaleAllSizes(s);
+    style.FontScaleMain = s;
+    return;
+#endif
     style.WindowRounding = 6.0f;
     style.FrameRounding = 4.0f;
     style.TabRounding = 4.0f;
@@ -415,6 +446,24 @@ void ui_context_begin(UiWindow window)
         if (GetFileAttributesA(font) != INVALID_FILE_ATTRIBUTES)
             io.Fonts->AddFontFromFileTTF(font, 17.0f);
     }
+#elif defined(__PROSPERO__)
+    {
+        // [ps5 port] No system fonts to borrow: the app carries its own (fonts/ in its folder). Oswald for the
+        // text and Bebas Neue for headings, both condensed like the game's lettering; Roboto if they are missing.
+        const char *root = getenv("DEFJAM_DATA");
+        std::string dir = std::string(root ? root : "/app0") + "/fonts/";
+        std::string body = dir + "Oswald-Regular.ttf", plain = dir + "Roboto-Medium.ttf", head = dir + "BebasNeue-Regular.ttf";
+        struct stat st;
+        if (stat(body.c_str(), &st) == 0 && io.Fonts->AddFontFromFileTTF(body.c_str(), 24.0f))
+            g_font_body_mid = 0.53f;
+        else if (stat(plain.c_str(), &st) == 0 && io.Fonts->AddFontFromFileTTF(plain.c_str(), 21.0f))
+            g_font_body_mid = 0.49f;
+        else
+            io.Fonts->AddFontDefault();
+        g_font_display = nullptr;
+        if (stat(head.c_str(), &st) == 0)
+            g_font_display = io.Fonts->AddFontFromFileTTF(head.c_str(), 24.0f);
+    }
 #else
     static const char *const fonts[] = {
         "/System/Library/Fonts/Supplemental/Arial.ttf", "/System/Library/Fonts/Helvetica.ttc",
@@ -435,6 +484,7 @@ void ui_context_end()
     g_start_values.clear();         // what was changed in the launcher has been applied: the overlay starts afresh
 }
 
+#if !defined(__PROSPERO__)
 // ---- generic setting widgets --------------------------------------------------------------------------
 
 // A bool, integer, choice or text setting as its natural control. Returns true when it changed.
@@ -526,6 +576,8 @@ static void page_display()
     ImGui::TextWrapped("Full screen, window size, filter, vsync and the 4:3 and stretch shapes apply as you change them. "
                        "The widescreen shapes, render scale and the brightness curve apply the next time the game starts. "
                        "F11 or Alt+Enter switches full screen while playing.");
+    ImGui::SeparatorText("While playing");
+    settings_group("ui", { "show_fps" });
 }
 
 static void page_textures()
@@ -593,15 +645,19 @@ static void page_controllers()
     }
     ImGui::TextWrapped("Press buttons and push the sticks to check them. The circles show the sticks after the dead zones below.");
 
+#if !defined(__PROSPERO__)
     ImGui::SeparatorText("Who plays");
     settings_group("input", { "keyboard_player", "players", "backend" });
+#endif
     ImGui::SeparatorText("Sticks and triggers");
     settings_group("gamepad", { "left_deadzone", "right_deadzone", "trigger_threshold", "button_threshold",
                                 "left_stick", "right_stick" });
     ImGui::SeparatorText("Rumble");
     settings_group("input", { "rumble", "rumble_floor", "rumble_min_ms", "rumble_on_connect" });
+#if !defined(__PROSPERO__)
     ImGui::SeparatorText("Pointer");
     settings_group("input", { "hide_cursor", "confine_cursor" });
+#endif
 }
 
 static void page_pad_buttons()
@@ -836,10 +892,14 @@ UiResult ui_draw(UiMode mode, float x, float y, float width, float height)
     ImGui::BeginChild("page", ImVec2(0, -footer), ImGuiChildFlags_None);
     if (ImGui::BeginTabBar("pages")) {
         if (ImGui::BeginTabItem("Display")) { page_display(); ImGui::EndTabItem(); }
+#if !defined(__PROSPERO__)     /* [ps5 port] no texture packs or keyboard on the console yet */
         if (ImGui::BeginTabItem("Textures")) { page_textures(); ImGui::EndTabItem(); }
+#endif
         if (ImGui::BeginTabItem("Controllers")) { page_controllers(); ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("Pad buttons")) { page_pad_buttons(); ImGui::EndTabItem(); }
+#if !defined(__PROSPERO__)
         if (ImGui::BeginTabItem("Keyboard & mouse")) { page_keyboard(); ImGui::EndTabItem(); }
+#endif
         if (ImGui::BeginTabItem("General")) { page_general(mode); ImGui::EndTabItem(); }
         ImGui::EndTabBar();
     }
@@ -865,14 +925,22 @@ UiResult ui_draw(UiMode mode, float x, float y, float width, float height)
         ImGui::PopStyleColor(2);
         if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere(-1);
     } else {
+#if !defined(__PROSPERO__)
         RecompSetting *skip = find("launcher", "skip");
         if (skip) setting_widget(skip);
         ImGui::SameLine(ImGui::GetWindowWidth() - bw - ImGui::GetStyle().WindowPadding.x);
+#else
+        ImGui::SetCursorPosX(ImGui::GetWindowWidth() - bw - ImGui::GetStyle().WindowPadding.x);
+#endif
         if (ImGui::Button("Close", ImVec2(bw, 0))) result.leave = true;
     }
     ImGui::End();
     return result;
 }
+#else
+#include <math.h>
+#include "pc_ui_ps5.inc"
+#endif
 
 // ---- the overlay ----------------------------------------------------------------------------------------------------
 
@@ -884,6 +952,8 @@ namespace {
 
 std::atomic<bool> g_open(false);
 std::atomic<bool> g_toggle(false);
+std::atomic<bool> g_show_fps(false);    // [ui] show_fps: the frame counter, drawn even with the overlay closed
+std::atomic<int> g_side_mode(1);        // [display] widescreen_side_fill: 0 blur, 1 black, 2 border (the Vulkan overlay draws 0 and 2)
 bool g_just_opened = false;
 bool g_ready = false;               // the context and backends exist (under the lock)
 #if defined(_WIN32)
@@ -972,6 +1042,8 @@ extern "C" void pc_ui_apply_settings(void)
     int vk = input_key_from_name(key.c_str());
     g_overlay_vk = vk > 0 ? vk : VK_F1;
     parse_chords();
+    g_show_fps = recomp_settings_get("ui", "show_fps", 0) != 0;
+    g_side_mode = recomp_settings_get("display", "widescreen_side_fill", 0);
     if (g_ready) ui_apply_scale(g_window);
     ui_unlock();
 }
@@ -1176,11 +1248,256 @@ void ui_sdl_frame(float width, float height, float framebuffer_scale)
 // ---- the overlay, drawn by the toolkit's Vulkan present --------------------------------------------------------------
 
 #include "d3d8_vk.h"
+#include "imgui_internal.h"   // ImGui::RegisterUserTexture, for the border picture
+
+#include <math.h>
+#include <pthread.h>
+#define STB_IMAGE_IMPLEMENTATION
+#define STB_IMAGE_STATIC
+#define STBI_ONLY_PNG
+#define STBI_ONLY_JPEG
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-function"
+#pragma clang diagnostic ignored "-Wunused-but-set-variable"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#endif
+#include "../../tools/xboxrecomp/src/nv2a/stb/stb_image.h"
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+
+extern "C" float ws_k(void);                    // src/patches/widescreen.c
+extern "C" uint32_t nv2a_ws_boxed_frames(void); // the toolkit's NV2A executor
+extern "C" uint32_t nv2a_ws_wide_frames(void);
+#if defined(__PROSPERO__)
+extern "C" void ps5_off_guest_cpu(void);        // ps5/src/host_ps5.c
+#endif
 
 namespace {
 
 uint32_t g_vk_generation;
+
+// ---- the border beside the 4:3 picture ----------------------------------------------------------------------------
+// [display] widescreen_side_fill = border. A picture, borders/border.png in the data folder, fills the side
+// areas whenever the title draws nothing there (a 2D menu, a movie, a loading screen) and fades out as soon as it
+// does (a fight, a cutscene, a menu over a 3D room). With the 4:3 picture shape it fills the bars beside the picture
+// all the time. The image is laid over the whole screen and only what lies beside the picture shows, so a 16:9
+// image drawn for the TV lines up as it was drawn.
+struct Border {
+    std::atomic<int> state{0};          // 0 not read, 1 reading, 2 read, 3 none (missing or unreadable)
+    unsigned char *pixels = nullptr;    // the image (RGBA), until its strips are in the texture
+    int w = 0, h = 0;
+    ImTextureData tex;                  // the left and right strips side by side
+    bool made = false;
+    float u_left = 0.0f, u_right = 0.0f;    // where the left strip ends and the right one starts, in the texture
+    bool on = false;
+    float alpha = 0.0f;
+    unsigned changes = 0;
+};
+Border g_border;
+
+std::string border_path()
+{
+    const char *root = getenv("DEFJAM_DATA");
+#if defined(__PROSPERO__)
+    // [display] border picks the picture: the logo, red or gold edge, or the plain one.
+    static const char *const files[] = { "border-logo.png", "border-red.png", "border-gold.png", "border.png" };
+    int pick = recomp_settings_get("display", "border", 0);
+    if (pick < 0 || pick > 3) pick = 0;
+    std::string dir = std::string(root ? root : "/app0") + "/borders/", path = dir + files[pick];
+    struct stat st;
+    return stat(path.c_str(), &st) == 0 ? path : dir + "border.png";
+#else
+    return std::string(root ? root : ".") + "/borders/border.png";
+#endif
+}
+
+void *border_read(void *)
+{
+#if defined(__PROSPERO__)
+    ps5_off_guest_cpu();                // started from the title's present: off its CPU before the work
+#endif
+    std::string path = border_path();
+    unsigned long long t0 = SDL_GetTicksNS();
+    int w = 0, h = 0, n = 0;
+    unsigned char *px = stbi_load(path.c_str(), &w, &h, &n, 4);
+    if (!px || w < 16 || h < 16) {
+        fprintf(stderr, "[UI] no border picture at %s (%s)\n", path.c_str(), px ? "too small" : stbi_failure_reason());
+        if (px) stbi_image_free(px);
+        g_border.state = 3;
+        return nullptr;
+    }
+    g_border.pixels = px;
+    g_border.w = w;
+    g_border.h = h;
+    fprintf(stderr, "[UI] border picture %dx%d read in %.0f ms\n", w, h, (SDL_GetTicksNS() - t0) / 1e6);
+    g_border.state = 2;
+    return nullptr;
+}
+
+void border_start_read()
+{
+    int idle = 0;
+    if (!g_border.state.compare_exchange_strong(idle, 1)) return;
+    pthread_attr_t attr;
+    pthread_t thread;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 512 * 1024);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&thread, &attr, border_read, nullptr) != 0) {
+        fprintf(stderr, "[UI] could not start reading the border picture\n");
+        g_border.state = 3;
+    }
+    pthread_attr_destroy(&attr);
+}
+
+// Once a present: whether the border should show, and its fade. True while any of it is on screen.
+bool border_tick()
+{
+    int mode = g_side_mode.load();
+    if (mode != 0 && mode != 2) {
+        g_border.on = false;
+        g_border.alpha = 0.0f;
+        return false;
+    }
+    if (mode == 2) {                    // the border needs its picture; the blur needs nothing
+        int state = g_border.state.load();
+        if (state == 0) border_start_read();
+        if (state != 2) return false;
+    }
+    bool was = g_border.on;
+    float k = ws_k();
+    if (!(k < 1.0f))
+        g_border.on = true;             // the 4:3 shape: what is beside the picture is never the title's
+    else if (nv2a_ws_boxed_frames() >= 3)
+        g_border.on = true;
+    else if (nv2a_ws_wide_frames() >= 2)
+        g_border.on = false;
+    if (g_border.on != was && g_border.changes++ < 40)
+        fprintf(stderr, "[UI] %s %s\n", mode == 2 ? "border" : "blurred sides", g_border.on ? "shown" : "hidden");
+    // In over about a quarter of a second, out twice as fast so the game's own sides are not covered for long.
+    g_border.alpha += g_border.on ? 1.0f / 15.0f : -1.0f / 7.0f;
+    if (g_border.alpha < 0.0f) g_border.alpha = 0.0f;
+    if (g_border.alpha > 1.0f) g_border.alpha = 1.0f;
+    if (mode == 0 && g_border.alpha > 0.0f)
+        d3d8_vk_request_side_blur();    // made in this present, handed to draw() as side_blur
+    return g_border.alpha > 0.0f;
+}
+
+// The blurred picture as an ImGui texture (a descriptor set of the Vulkan backend).
+VkSampler g_blur_sampler = VK_NULL_HANDLE;
+VkDescriptorSet g_blur_set = VK_NULL_HANDLE;
+uint32_t g_blur_for_image = 0, g_blur_for_backend = 0;
+
+// The sides as the picture's own middle, stretched, blurred and darkened (a TV's ambient mode).
+void blur_draw(ImDrawList *dl, const D3D8VkOverlayFrame *f, int x0, int x1)
+{
+    if (!f->side_blur) return;
+    if (!g_blur_sampler) {
+        VkSamplerCreateInfo si = {};
+        si.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        si.magFilter = si.minFilter = VK_FILTER_LINEAR;
+        si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        si.maxLod = 1.0f;
+        if (vkCreateSampler((VkDevice)f->device, &si, nullptr, &g_blur_sampler) != VK_SUCCESS) {
+            g_blur_sampler = VK_NULL_HANDLE;
+            return;
+        }
+    }
+    if (!g_blur_set || g_blur_for_image != f->side_blur_generation || g_blur_for_backend != g_vk_generation) {
+        if (g_blur_set && g_blur_for_backend == g_vk_generation) ImGui_ImplVulkan_RemoveTexture(g_blur_set);
+        g_blur_set = ImGui_ImplVulkan_AddTexture(g_blur_sampler, (VkImageView)f->side_blur,
+                                                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        g_blur_for_image = f->side_blur_generation;
+        g_blur_for_backend = g_vk_generation;
+        fprintf(stderr, "[UI] blurred sides ready\n");
+    }
+    if (!g_blur_set) return;
+    // The blurred middle spread over the whole picture; only what falls beside the box shows.
+    float px0 = (float)f->picture_x0, pw = (float)(f->picture_x1 - f->picture_x0), h = (float)f->height;
+    float w = (float)f->width;
+    int shade = 125;                    // about half as bright as the picture itself
+    ImU32 col = IM_COL32(shade, shade, shade, (int)(g_border.alpha * 255.0f + 0.5f));
+    ImTextureRef ref((ImTextureID)g_blur_set);
+    if (x0 > 0)
+        dl->AddImage(ref, ImVec2(0, 0), ImVec2((float)x0, h), ImVec2((0 - px0) / pw, 0), ImVec2((x0 - px0) / pw, 1), col);
+    if (x1 < (int)w)
+        dl->AddImage(ref, ImVec2((float)x1, 0), ImVec2(w, h), ImVec2((x1 - px0) / pw, 0), ImVec2((w - px0) / pw, 1), col);
+}
+
+// Cut the parts of the image that show beside the box (x0..x1 of a window w wide) into one texture.
+bool border_make(int x0, int x1, int w)
+{
+    if (g_border.made) return true;
+    if (!g_border.pixels) return false;
+    int iw = g_border.w, ih = g_border.h;
+    double fl = x0 > 0 ? (double)x0 / w : 0.0, fr = x1 < w ? (double)(w - x1) / w : 0.0;
+    int lc = fl > 0.0 ? (int)ceil(fl * iw) + 1 : 0, rc = fr > 0.0 ? (int)ceil(fr * iw) + 1 : 0;
+    if (lc > iw) lc = iw;
+    if (rc > iw) rc = iw;
+    int tw = lc + rc;
+    if (tw <= 0) return false;
+    g_border.tex.Create(ImTextureFormat_RGBA32, tw, ih);
+    for (int y = 0; y < ih; y++) {
+        unsigned char *dst = (unsigned char *)g_border.tex.GetPixelsAt(0, y);
+        const unsigned char *src = g_border.pixels + (size_t)y * iw * 4;
+        memcpy(dst, src, (size_t)lc * 4);
+        memcpy(dst + (size_t)lc * 4, src + (size_t)(iw - rc) * 4, (size_t)rc * 4);
+    }
+    g_border.tex.UseColors = true;
+    ImGui::RegisterUserTexture(&g_border.tex);
+    g_border.u_left = (float)(fl * iw / tw);
+    g_border.u_right = (float)((lc + (rc - fr * iw)) / tw);
+    stbi_image_free(g_border.pixels);
+    g_border.pixels = nullptr;
+    g_border.made = true;
+    fprintf(stderr, "[UI] border ready: %d + %d columns of the picture beside x %d..%d\n", lc, rc, x0, x1);
+    return true;
+}
+
+void border_draw(ImDrawList *dl, const D3D8VkOverlayFrame *f)
+{
+    if (g_border.alpha <= 0.0f) return;
+    float k = ws_k();
+    if (!(k > 0.0f && k < 1.0f)) k = 1.0f;
+    float pw = (float)(f->picture_x1 - f->picture_x0), cx = (f->picture_x0 + f->picture_x1) * 0.5f;
+    int w = (int)f->width, h = (int)f->height;
+    int x0 = (int)floorf(cx - pw * k * 0.5f + 0.5f), x1 = (int)floorf(cx + pw * k * 0.5f + 0.5f);
+    if (pw <= 0.0f || (x0 <= 0 && x1 >= w)) return;
+    if (g_side_mode.load() == 0) {
+        blur_draw(dl, f, x0, x1);
+        return;
+    }
+    if (!border_make(x0, x1, w)) return;
+    ImU32 col = IM_COL32(255, 255, 255, (int)(g_border.alpha * 255.0f + 0.5f));
+    ImTextureRef ref = g_border.tex.GetTexRef();
+    if (x0 > 0 && g_border.u_left > 0.0f)
+        dl->AddImage(ref, ImVec2(0, 0), ImVec2((float)x0, (float)h), ImVec2(0, 0), ImVec2(g_border.u_left, 1), col);
+    if (x1 < w && g_border.u_right < 1.0f)
+        dl->AddImage(ref, ImVec2((float)x1, 0), ImVec2((float)w, (float)h), ImVec2(g_border.u_right, 0),
+                     ImVec2(1, 1), col);
+}
 std::atomic<unsigned> g_frame_w(0), g_frame_h(0);       // what the overlay was last drawn into, in pixels
+
+#if defined(__PROSPERO__)
+// [ps5 port] A first-run guard: the overlay's Vulkan drawing has not run on the console before, and
+// with the frame counter on it starts on the first frame. A marker file is written before it starts
+// and removed once a frame has gone through; found at start-up, the last start failed there, and the
+// overlay stays off for this run (the next run tries again).
+std::string overlay_guard_path()
+{
+    const char *root = getenv("DEFJAM_DATA");
+    return std::string(root ? root : "/app0") + "/logs/overlay-starting";
+}
+bool g_overlay_off = false;
+int g_guard_frames = -1;            // frames drawn since the marker was written; -1 none written
+#endif
 
 // Asked once a frame whether to draw: this is where the hotkey and the pad chord are looked for.
 int overlay_active(void *)
@@ -1189,15 +1506,72 @@ int overlay_active(void *)
     if (!configured) {
         configured = true;
         pc_ui_apply_settings();
+#if defined(__PROSPERO__)
+        struct stat st;
+        if (stat(overlay_guard_path().c_str(), &st) == 0) {
+            g_overlay_off = true;
+            unlink(overlay_guard_path().c_str());
+            fprintf(stderr, "[UI] the in-game menu did not start last time; it is off for this run\n");
+        }
+#endif
     }
+#if defined(__PROSPERO__)
+    if (g_overlay_off)
+        return 0;
+#endif
     ui_lock();
     bool toggled = g_toggle.exchange(false);
     if (!ui_capturing() && !g_chords.empty() && pad_toggle_pressed()) toggled = true;
     if (toggled) set_open(!g_open.load());
     bool open = g_open.load();
     ui_unlock();
-    return open ? 1 : 0;
+    bool border = border_tick();
+    return open || g_show_fps.load() || border ? 1 : 0;
 }
+
+// The frame counter: presents in the last half second, and the time between the last two.
+struct FpsCounter {
+    unsigned long long window_start = 0, last = 0;
+    unsigned frames = 0;
+    float fps = 0.0f, ms = 0.0f, worst_ms = 0.0f, window_worst = 0.0f;
+
+    void tick()
+    {
+        unsigned long long now = SDL_GetTicksNS();
+        if (last) {
+            float d = (float)((now - last) / 1e6);
+            ms = d;
+            if (d > window_worst) window_worst = d;
+        }
+        last = now;
+        if (!window_start) window_start = now;
+        frames++;
+        if (now - window_start >= 500000000ull) {
+            fps = frames * 1e9f / (float)(now - window_start);
+            worst_ms = window_worst;
+            window_start = now;
+            frames = 0;
+            window_worst = 0.0f;
+        }
+    }
+
+    // Top right, small, readable on any background.
+    void draw(ImDrawList *dl, const ImVec2 &display)
+    {
+        char text[48];
+        snprintf(text, sizeof text, "%.0f FPS  %.1f ms", fps, worst_ms);
+        float size = ImGui::GetFontSize() * 0.9f;
+        ImVec2 ts = ImGui::GetFont()->CalcTextSizeA(size, FLT_MAX, 0.0f, text);
+        float pad = size * 0.35f;
+        ImVec2 pos(display.x - ts.x - pad * 3, pad * 2);
+        dl->AddRectFilled(ImVec2(pos.x - pad, pos.y - pad * 0.6f), ImVec2(pos.x + ts.x + pad, pos.y + ts.y + pad * 0.6f),
+                          IM_COL32(0, 0, 0, 150), pad);
+        ImU32 col = fps >= 58.0f ? IM_COL32(120, 230, 120, 255) : fps >= 45.0f ? IM_COL32(240, 200, 80, 255)
+                                                                  : IM_COL32(240, 90, 80, 255);
+        dl->AddText(ImGui::GetFont(), size, pos, col, text);
+    }
+};
+FpsCounter g_fps;
 
 void overlay_init_backend(const D3D8VkOverlayFrame *f)
 {
@@ -1219,13 +1593,30 @@ void overlay_init_backend(const D3D8VkOverlayFrame *f)
 void overlay_draw(const D3D8VkOverlayFrame *f, void *)
 {
     ui_lock();
-    if (!g_open.load()) { ui_unlock(); return; }
+    bool open = g_open.load(), fps = g_show_fps.load();
+    if (fps)
+        g_fps.tick();
+#if defined(__PROSPERO__)
+    if (g_guard_frames >= 0 && ++g_guard_frames >= 3) {
+        unlink(overlay_guard_path().c_str());          // two frames of it went through
+        g_guard_frames = -1;
+    }
+#endif
+    bool border = g_border.alpha > 0.0f;
+    if (!open && !fps && !border) { ui_unlock(); return; }
     if (g_ready && f->generation != g_vk_generation) {
         // The window's image has another format: the pipelines were built for the old pass.
         ImGui_ImplVulkan_Shutdown();
         overlay_init_backend(f);
     }
     if (!g_ready) {
+#if defined(__PROSPERO__)
+        if (FILE *g = fopen(overlay_guard_path().c_str(), "w")) {
+            fputs("The in-game menu was starting when the game stopped.\n", g);
+            fclose(g);
+            g_guard_frames = 0;
+        }
+#endif
         ui_context_begin(nullptr);
         g_last_frame_ns = 0;
         overlay_init_backend(f);
@@ -1241,22 +1632,40 @@ void overlay_draw(const D3D8VkOverlayFrame *f, void *)
         ui_set_extra_scale(h < 1.0f ? 1.0f : h > 2.4f ? 2.4f : h);
     }
     ui_apply_scale(nullptr);
-    ui_feed_gamepad();
+    if (open)
+        ui_feed_gamepad();
     ImGui_ImplVulkan_NewFrame();
     ui_sdl_frame((float)f->width, (float)f->height, 1.0f);
     ImGui::NewFrame();
+    ImGuiIO &io = ImGui::GetIO();
+    if (border)
+        border_draw(ImGui::GetBackgroundDrawList(), f);    // first, so the menu's dimming covers it
+    if (fps)
+        g_fps.draw(ImGui::GetForegroundDrawList(), io.DisplaySize);
+    if (!open) {
+        // The frame counter and the border alone: nothing to navigate, nothing dimmed.
+        ImGui::Render();
+        ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), (VkCommandBuffer)f->command_buffer);
+        ui_unlock();
+        return;
+    }
 
     // Dim the game and put the settings in a panel in the middle (as the Direct3D overlay does).
-    ImGuiIO &io = ImGui::GetIO();
     if (g_just_opened) {
         g_just_opened = false;
         ImGui::SetNextWindowFocus();
     }
     ImDrawList *bg = ImGui::GetBackgroundDrawList();
+#if defined(__PROSPERO__)
+    // [ps5 port] A narrower panel over a darker game: a pause screen, not a dialog.
+    bg->AddRectFilled(ImVec2(0, 0), io.DisplaySize, IM_COL32(0, 0, 0, 175));
+    float pw = io.DisplaySize.x * 0.58f, ph = io.DisplaySize.y * 0.84f;
+#else
     bg->AddRectFilled(ImVec2(0, 0), io.DisplaySize, IM_COL32(0, 0, 0, 150));
     float pw = io.DisplaySize.x * 0.82f, ph = io.DisplaySize.y * 0.86f;
     if (pw < 560) pw = io.DisplaySize.x;
     if (ph < 420) ph = io.DisplaySize.y;
+#endif
     bool close_request = false;
     {
         ImGui::SetNextWindowBgAlpha(0.96f);

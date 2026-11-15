@@ -20,6 +20,9 @@
 /* A project may set this to watch every guest path the kernel translates (for
  * example to print who opened a file). NULL by default. */
 void (*g_xbox_path_hook)(const char *xbox_path) = NULL;
+/* A project may set this to serve a file from somewhere else: it gets the host
+ * path a guest path translated to and may rewrite it in place (POSIX hosts). */
+void (*g_xbox_host_path_override)(char *host_path, size_t size) = NULL;
 
 /*
  * Helper: check if an ANSI string starts with a prefix (case-insensitive).
@@ -882,6 +885,8 @@ translate:
         }
         match_case_below(host_path_buf,
                          strlen(base_dir) + (sub_dir ? strlen(sub_dir) : 0));
+        if (g_xbox_host_path_override)
+            g_xbox_host_path_override(host_path_buf, buf_size);
 
         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %s", xbox_path, host_path_buf);
         return TRUE;
