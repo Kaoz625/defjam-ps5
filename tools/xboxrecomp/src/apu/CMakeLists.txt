@@ -46,7 +46,12 @@ else()
     # audio device and libm. SDL2 (apu_sdl2.c) by default; with
     # XBOXRECOMP_SDL3 the same contract on SDL3 (apu_sdl3.c), for a port
     # whose window and input are SDL3 -- one process cannot hold both.
-    if(XBOXRECOMP_SDL3)
+    if(PS5)
+        # [ps5 port] sceAudioOut (apu_ps5.c), from the PS5 SDK's
+        # libSceAudioOut, implementing the same xa2_* contract.
+        target_sources(xbox_apu PRIVATE apu_ps5.c)
+        target_link_libraries(xbox_apu PRIVATE platform SceAudioOut m)
+    elseif(XBOXRECOMP_SDL3)
         find_package(SDL3 REQUIRED CONFIG)
         target_sources(xbox_apu PRIVATE apu_sdl3.c)
         target_link_libraries(xbox_apu PRIVATE platform SDL3::SDL3 m)

@@ -577,6 +577,7 @@ extern void (*g_xbox_path_hook)(const char *xbox_path);
  * the game folder; save-area paths never reach it.
  * NULL by default. */
 extern BOOL (*g_xbox_game_file_redirect)(const char *relative, xbox_host_char *host_path, DWORD size);
+extern void (*g_xbox_host_path_override)(char *host_path, size_t size);
 /* Tell the script-anchor clocks a path was opened (kernel_script_anchor.c). */
 void xbox_AnchorNoteOpen(const char *xbox_path);
 

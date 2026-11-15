@@ -255,8 +255,13 @@ BOOL  TerminateProcess(HANDLE process, UINT exitCode);
 VOID  SecureZeroMemory(PVOID ptr, SIZE_T cnt);
 unsigned int _clearfp(void);   /* clear pending FPU exception flags */
 
-/* MSVC stack alloca alias. <alloca.h> provides the underlying function. */
+/* MSVC stack alloca alias. <alloca.h> provides the underlying function
+ * (FreeBSD, and so the PS5, declares it in <stdlib.h>). */
+#if defined(__FreeBSD__)
+#include <stdlib.h>
+#else
 #include <alloca.h>
+#endif
 #define _alloca(n) alloca(n)
 
 /* ---- Win32 file API (POSIX-backed) ----------------------------------- */

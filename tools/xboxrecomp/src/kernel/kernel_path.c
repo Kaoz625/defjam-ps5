@@ -23,6 +23,9 @@
 void (*g_xbox_path_hook)(const char *xbox_path) = NULL;
 /* A project may serve some game-volume files from elsewhere (kernel.h). */
 BOOL (*g_xbox_game_file_redirect)(const char *relative, xbox_host_char *host_path, DWORD size) = NULL;
+/* A project may set this to serve a file from somewhere else: it gets the host
+ * path a guest path translated to and may rewrite it in place (POSIX hosts). */
+void (*g_xbox_host_path_override)(char *host_path, size_t size) = NULL;
 
 /*
  * Helper: check if an ANSI string starts with a prefix (case-insensitive).
@@ -1071,6 +1074,8 @@ translate:
         }
         match_case_below(host_path_buf,
                          strlen(base_dir) + (sub_dir ? strlen(sub_dir) : 0));
+        if (g_xbox_host_path_override)
+            g_xbox_host_path_override(host_path_buf, buf_size);
 
         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %s", xbox_path, host_path_buf);
         /* As the Win32 backend does: the bridge reads back the host path

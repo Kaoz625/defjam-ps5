@@ -21,6 +21,17 @@ if(WIN32)
     # Offline smoke test for the pure format layer (no D3D11 device needed).
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3d8_smoke
                      ${CMAKE_CURRENT_BINARY_DIR}/d3d8_smoke)
+elseif(PS5)
+    # [ps5 port] The Vulkan device on RADV, which is linked into the app; the
+    # entry points come from ps5/src/vk_ps5_loader.c and shaderc from
+    # ps5/shaderc (glslang). Both targets are made by ps5/cmake/ps5.cmake.
+    add_library(xbox_d3d8 STATIC
+        d3d8_vk.c
+        d3d8_formats.c
+        d3d8_combiners.c
+    )
+    target_link_libraries(xbox_d3d8 PUBLIC platform Vulkan::Vulkan defjam_shaderc)
+    target_compile_definitions(xbox_d3d8 PUBLIC XBOXRECOMP_HAVE_VULKAN=1)
 else()
     # Off Windows the device is Vulkan (MoltenVK on macOS) when the Vulkan
     # loader and shaderc are installed, and the older OpenGL one otherwise.

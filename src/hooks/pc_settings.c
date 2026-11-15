@@ -20,6 +20,9 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "host.h"
 #include <stdio.h>
+#if defined(__PROSPERO__)
+#include <dirent.h>
+#endif
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -195,6 +198,13 @@ static int find_game_root(void)
     char dir[PATH_MAX], probe[PATH_MAX + 32];
     int up;
 
+#if defined(__PROSPERO__)
+    {   /* [ps5 port] the disc is in <app folder>/GameData (ps5/src/host_ps5.c) */
+        extern const char *ps5_game_xbe(void);
+        (void)dir; (void)probe; (void)up;
+        return file_exists(ps5_game_xbe());
+    }
+#endif
     if (file_exists("game/default.xbe"))
         return 1;
     if (!program_path(dir, sizeof(dir)))
@@ -240,6 +250,12 @@ static void open_log_if_needed(void)
     struct tm *t = localtime(&now);
     struct stat st;
 
+#if defined(__PROSPERO__)
+    /* [ps5 port] ps5/src/host_ps5.c already sends the output to the app's
+     * logs folder; a relative path here would fail and close it. */
+    (void)name; (void)now; (void)t; (void)st;
+    return;
+#endif
     /* A terminal, a pipe or a file the caller chose all keep the output;
      * only /dev/null, which is what a launcher hands a program, loses it. */
     if (fstat(STDERR_FILENO, &st) == 0
@@ -318,11 +334,85 @@ void pc_settings_apply_display(void)
     d3d8_present_set_vsync(pc_display("vsync", 1));
     picture_apply_settings();
     cheats_apply_settings();
+#if defined(__PROSPERO__)
+    {
+        extern void ps5_set_frame_generation(int on);     /* ps5/src/host_ps5.c: the generator and the TV's rate */
+        extern void d3d8_vk_set_native_bc(int on);
+        ps5_set_frame_generation(pc_display("frame_gen", 0));
+        /* Compressed textures covers the game's own DXT textures on the GPU too. */
+        d3d8_vk_set_native_bc(recomp_settings_get("textures", "compress", 1));
+    }
+#endif
 }
+
+#if defined(__PROSPERO__)
+/* [ps5 port] The app's own packs, in mods/: the PlayStation buttons, always, the HD packs when
+ * they are on, and the owner's art in custom/, listed last so it wins; and whether they are kept
+ * compressed. At start, and again when the menu switches one (texture_pack_reload). Variables a
+ * player set before the start are left as they are. */
+static int s_ps5_packs_ours, s_ps5_compress_ours;
+
+static void ps5_texture_env(void)
+{
+    int hd = recomp_settings_get("textures", "enabled", 1);
+    int menus = recomp_settings_get("textures", "menus", 0);
+    if (s_ps5_packs_ours) {
+        /* Every folder in mods/ is a pack: the HD packs in name order, then playstation
+         * (an HD pack holds the Xbox buttons too), then custom: the last one wins. */
+        char list[1024] = "", names[32][64], dir[MAX_PATH];
+        int n = 0, i, j;
+        DIR *d;
+        struct dirent *ent;
+        const char *data = getenv("DEFJAM_DATA");
+        snprintf(dir, sizeof dir, "%s/mods", data && *data ? data : ".");
+        if ((hd || menus) && (d = opendir(dir)) != NULL) {
+            while ((ent = readdir(d)) != NULL && n < 32) {
+                if (ent->d_name[0] == '.' || !strcmp(ent->d_name, "playstation") ||
+                    !strcmp(ent->d_name, "custom") || strlen(ent->d_name) >= sizeof names[0])
+                    continue;
+                /* hd-menus (the AI menus and HUD) has a switch of its own */
+                if (!strncmp(ent->d_name, "hd-menus", 8) ? !menus : !hd)
+                    continue;
+                snprintf(names[n++], sizeof names[0], "%s", ent->d_name);
+            }
+            closedir(d);
+        }
+        for (i = 1; i < n; i++)
+            for (j = i; j > 0 && strcmp(names[j - 1], names[j]) > 0; j--) {
+                char t[64];
+                memcpy(t, names[j], sizeof t); memcpy(names[j], names[j - 1], sizeof t); memcpy(names[j - 1], t, sizeof t);
+            }
+        for (i = 0; i < n; i++) {
+            strncat(list, names[i], sizeof list - strlen(list) - 2);
+            strcat(list, ";");
+        }
+        strcat(list, "playstation;custom");     /* the buttons over any HD pack's Xbox ones */
+        _putenv_s("RECOMP_TEXTURE_PACKS", list);
+        fprintf(stderr, "[SETTINGS] texture packs: %s\n", list);
+    }
+    if (s_ps5_compress_ours) {
+        extern const char *ps5_root(void);
+        char cache[MAX_PATH];
+        int on = recomp_settings_get("textures", "compress", 1);
+        _putenv_s("RECOMP_TEXTURE_COMPRESS", on ? "1" : "0");
+        snprintf(cache, sizeof cache, "%s/texture-cache", ps5_root());
+        if (!getenv("RECOMP_TEXTURE_DISK_CACHE"))
+            _putenv_s("RECOMP_TEXTURE_DISK_CACHE", cache);
+    }
+}
+#endif
 
 static void setting_changed(const RecompSetting *s, void *user)
 {
     (void)user;
+#if defined(__PROSPERO__)
+    if (!strcmp(s->section, "textures") &&
+        (!strcmp(s->key, "enabled") || !strcmp(s->key, "menus") || !strcmp(s->key, "compress"))) {
+        extern void texture_pack_reload(void);
+        ps5_texture_env();
+        texture_pack_reload();
+    }
+#endif
     pc_settings_apply_display();
     pc_input_apply();
     pc_ui_apply_settings();
@@ -422,6 +512,9 @@ int pc_settings_init(void)
     int have_game = find_game_root();
     int have_root;
 
+#if defined(__PROSPERO__)
+    fprintf(stderr, "[PS5] settings: found the game files\n");
+#endif
     if (have_game)
         open_log_if_needed();
     if (!have_game) {
@@ -433,19 +526,65 @@ int pc_settings_init(void)
         return 0;
     }
     supply_runtime_defaults();
+#if defined(__PROSPERO__)
+    fprintf(stderr, "[PS5] settings: runtime defaults set\n");
+#endif
     have_root = find_data_root(root, sizeof(root));
+#if defined(__PROSPERO__)
+    fprintf(stderr, "[PS5] settings: data folder found\n");
+#endif
 
     if (env && !_stricmp(env, "none")) {
         g_path[0] = 0;
     } else if (env && *env) {
         snprintf(g_path, sizeof(g_path), "%s", env);
     } else if (have_root) {
+#if defined(__PROSPERO__)
+        /* [ps5 port] Beside the saves, outside the app folder when it can be (ps5/src/host_ps5.c). */
+        extern const char *ps5_settings_path(char *out, size_t size);
+        ps5_settings_path(g_path, sizeof(g_path));
+        (void)root;
+#else
         snprintf(g_path, sizeof(g_path), "%s" HOST_SEP "settings.ini", root);
+#endif
     } else if (program_dir(g_path, MAX_PATH)) {
         strcat(g_path, HOST_SEP "settings.ini");
     }
 
     pc_settings_open(g_path);
+#if defined(__PROSPERO__)
+    {
+        /* [ps5 port] A settings.ini written by an earlier build holds that
+         * build's defaults (4:3, twice the console's resolution), which win
+         * over new ones. Once per new set: bring it up to this build's. */
+        enum { PS5_DEFAULTS = 26 };
+        int had = recomp_settings_get("ps5", "defaults", 0);
+        if (had < 22)       /* the border beside 4:3 menus */
+            recomp_settings_set("display", "widescreen_side_fill", PC_DEFAULT_SIDE_FILL);
+        if (had < 23) {     /* the HD packs on, and the logo border */
+            recomp_settings_set("textures", "enabled", 1);
+            recomp_settings_set("display", "border", 0);
+        }
+        if (had < 24)       /* no buzz when the game starts */
+            recomp_settings_set("input", "rumble_on_connect", 0);
+        if (had < 25)       /* v1.0: no frame counter */
+            recomp_settings_set("ui", "show_fps", 0);
+        if (had < 26)       /* the AI menus are opt-in */
+            recomp_settings_set("textures", "menus", 0);
+        if (had < 21) {
+            recomp_settings_set("display", "aspect", PC_DEFAULT_ASPECT);
+            recomp_settings_set("display", "render_scale", PC_DEFAULT_RENDER_SCALE);
+            recomp_settings_set("display", "output_4k", 1);
+            recomp_settings_set("ui", "show_fps", 1);
+            recomp_settings_set_text("ui", "overlay_pad", "left_stick_click+right_stick_click");
+        }
+        if (had < PS5_DEFAULTS) {
+            recomp_settings_set("ps5", "defaults", PS5_DEFAULTS);
+            if (g_path[0] && recomp_settings_save(g_path) == 0)
+                fprintf(stderr, "[SETTINGS] brought up to the console's defaults (set %d)\n", PS5_DEFAULTS);
+        }
+    }
+#endif
     if (have_root)
         fprintf(stderr, "[SETTINGS] data folder %s\n", root);
     else
@@ -468,6 +607,21 @@ int pc_settings_init(void)
 
     {
         char value[MAX_PATH*2], packs[RECOMP_SETTING_TEXT_MAX];
+#if defined(__PROSPERO__)
+        {
+            /* [ps5 port] The app's own packs, in mods/: the PlayStation buttons, always, the HD packs when
+             * they are on, and the owner's art in custom/, listed last so it wins. Then the text (ps5_text.c). */
+            extern void ps5_text_prepare(int playstation);
+            s_ps5_packs_ours = !getenv("RECOMP_TEXTURE_PACKS");
+            s_ps5_compress_ours = !getenv("RECOMP_TEXTURE_COMPRESS");
+            ps5_texture_env();
+            if (!getenv("RECOMP_TEXTURE_CACHE_MB"))
+                _putenv_s("RECOMP_TEXTURE_CACHE_MB", "2048");     /* the full HD pack thrashes 512 in a fight */
+            if (!getenv("RECOMP_TEXT_SHARPEN"))
+                _putenv_s("RECOMP_TEXT_SHARPEN", recomp_settings_get("display", "sharp_text", 1) ? "4" : "0");
+            ps5_text_prepare(1);
+        }
+#endif
         if (!getenv("RECOMP_TEXTURE_PACKS")) {
             recomp_settings_get_text("textures","packs",packs,sizeof packs,"faithful-hd");
             _putenv_s("RECOMP_TEXTURE_PACKS",recomp_settings_get("textures","enabled",0) ? packs : "");

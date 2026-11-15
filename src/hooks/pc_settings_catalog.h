@@ -20,6 +20,21 @@ extern "C" {
  * re-decoded dozens of textures every two seconds in a fight on the Steam Deck. */
 #define PC_TEXTURE_CACHE_MB 2048
 
+#if defined(__PROSPERO__)
+/* [ps5 port] A TV, 16:9 and 4K: widescreen, and the picture drawn at four
+ * times the console's resolution (3413x1920 in 16:9) for a 3840x2160 output;
+ * the border picture beside 4:3 menus, and the HD packs in mods/ on. */
+#define PC_DEFAULT_ASPECT 3        /* 16:9 */
+#define PC_DEFAULT_RENDER_SCALE 4
+#define PC_DEFAULT_SIDE_FILL 2     /* border */
+#define PC_DEFAULT_TEXTURES 1
+#else
+#define PC_DEFAULT_ASPECT 2        /* widescreen (auto) */
+#define PC_DEFAULT_RENDER_SCALE 2
+#define PC_DEFAULT_SIDE_FILL 0     /* blur */
+#define PC_DEFAULT_TEXTURES 0
+#endif
+
 /* Fill `out` with every setting, in the order the file is written. Returns the count. */
 size_t pc_settings_catalog(RecompSetting *out, size_t max);
 

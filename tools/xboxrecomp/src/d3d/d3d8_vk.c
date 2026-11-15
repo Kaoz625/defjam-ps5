@@ -102,7 +102,7 @@ static unsigned s_aspect_num = 4, s_aspect_den = 3;
 /* Widescreen canvas (d3d8_present.h): the title's target widened to num:den. */
 static unsigned s_canvas_num, s_canvas_den;
 /* Widescreen 2D placement for the next draws (nv2a_pb_exec.c, ws_place_batch). */
-static float s_place_kx = 1.0f, s_place_bx = 0.0f;
+static float s_place_kx = 1.0f, s_place_bx = 0.0f, s_place_ky = 1.0f, s_place_by = 0.0f;
 float d3d8_GetCanvasScaleX(void);
 float d3d8_GetCanvasScaleY(void);
 
@@ -206,6 +206,7 @@ typedef struct VkTex {
     VkImage        img;
     VkDeviceMemory mem;
     VkImageView    view;
+    VkFormat       vkfmt;       /* img's format: R8G8B8A8, or BC1/2/3 for DXT kept compressed */
     uint64_t   used_frame;      /* last frame a draw sampled img */
 } VkTex;
 
@@ -250,6 +251,7 @@ static struct {
     VkQueue          queue;
     VkPhysicalDeviceMemoryProperties memprops;
     VkDeviceSize     ubo_align;
+    int              bc;            /* DXT1/3/5 kept compressed on the GPU (BC1/2/3) */
 
     VkSurfaceKHR     surface;
     VkSwapchainKHR   swap;
@@ -755,12 +757,13 @@ static VkDeviceSize ring_take(Ring *r, VkDeviceSize bytes, VkDeviceSize align)
  * 11 backend's fixed-function shader does for FLAG_PRETRANSFORMED. The colour
  * arrives through a BGRA vertex format, so it is already in r,g,b,a order. */
 static const char s_vs_fixed[] =
-    "cbuffer VshFrame : register(b2) { float4 Screen; float4 TexScale; };\n"
+    "cbuffer VshFrame : register(b2) { float4 Screen; float4 TexScale; float4 PlaceY; };\n"
     "struct VS_IN { float4 pos : ATTR0; float4 color : ATTR1; float2 uv : ATTR2; };\n"
     VS_OUT_DECL
     "VS_OUT main(VS_IN i) {\n"
     "    VS_OUT o;\n"
-    "    o.pos = float4(i.pos.x * Screen.x - TexScale.w, 1.0 - i.pos.y * Screen.y, i.pos.z, 1.0);\n"
+    "    o.pos = float4(i.pos.x * Screen.x - TexScale.w,\n"
+    "                   1.0 - (i.pos.y * (1.0 + PlaceY.x) + PlaceY.y) * Screen.y, i.pos.z, 1.0);\n"
     "    if (i.pos.w != 0.0) o.pos /= i.pos.w;\n"
     "    o.diffuse = i.color;\n"
     "    o.specular = float4(0, 0, 0, 0);\n"
@@ -1508,6 +1511,47 @@ static int convert_level(const VkTex *t, UINT level, uint8_t *dst)
     return tex_to_rgba(&v, dst);
 }
 
+/* The format for a new image. DXT1/3/5 stay compressed on a device that samples BC:
+ * the title's blocks are copied as they are, a quarter (DXT1: an eighth) of the
+ * memory of R8G8B8A8 and no decode on the CPU. Everything else is converted. The
+ * host can ask for the decode instead (d3d8_vk_set_native_bc); images already made
+ * keep theirs. */
+static volatile int s_native_bc = 1;
+void d3d8_vk_set_native_bc(int on) { s_native_bc = on != 0; }
+
+static VkFormat tex_pick_format(const VkTex *t)
+{
+    if (vk.bc && s_native_bc)
+        switch ((uint32_t)t->format) {
+        case 0x0C: return VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+        case 0x0E: return VK_FORMAT_BC2_UNORM_BLOCK;
+        case 0x0F: return VK_FORMAT_BC3_UNORM_BLOCK;
+        default: break;
+        }
+    return VK_FORMAT_R8G8B8A8_UNORM;
+}
+
+/* Staging bytes for one level, and the level written there. */
+static VkDeviceSize level_bytes(const VkTex *t, UINT level)
+{
+    uint32_t lw = t->width >> level ? t->width >> level : 1, lh = t->height >> level ? t->height >> level : 1;
+    if (t->vkfmt != VK_FORMAT_R8G8B8A8_UNORM)
+        return compressed_bytes(t->format, lw, lh);
+    return (VkDeviceSize)lw * lh * 4;
+}
+
+static int fill_level(const VkTex *t, UINT level, uint8_t *dst)
+{
+    if (t->vkfmt != VK_FORMAT_R8G8B8A8_UNORM) {
+        const BYTE *src = level ? t->lvl[level] : t->sys;
+        if (!src)
+            return 0;
+        memcpy(dst, src, (size_t)level_bytes(t, level));
+        return 1;
+    }
+    return convert_level(t, level, dst);
+}
+
 /* ── IDirect3DTexture8 ─────────────────────────────────────────────────── */
 
 static HRESULT __stdcall tex_QueryInterface(IDirect3DTexture8 *s, const IID *iid, void **pp)
@@ -1593,26 +1637,28 @@ static int upload_level(VkTex *t, UINT level, VkDeviceSize at)
 static HRESULT __stdcall tex_UnlockRect(IDirect3DTexture8 *s, UINT lvl)
 {
     VkTex *t = (VkTex *)s;
-    uint32_t lw, lh, other;
+    uint32_t other;
     VkDeviceSize bytes, at;
+    int remake;
 
     if (lvl >= t->levels)
         return D3DERR_INVALIDCALL;
-    lw = t->width >> lvl ? t->width >> lvl : 1;
-    lh = t->height >> lvl ? t->height >> lvl : 1;
-    bytes = (VkDeviceSize)lw * lh * 4;
     if (!vk.ready)
         return D3DERR_INVALIDCALL;
     frame_begin();
+    remake = !t->img || t->used_frame == vk.frame;
+    if (remake)
+        t->vkfmt = tex_pick_format(t);
+    bytes = level_bytes(t, lvl);
     if (bytes > vk.stage.size)
         return D3DERR_INVALIDCALL;
-    at = ring_take(&vk.stage, bytes, 4);
-    if (!convert_level(t, lvl, vk.stage.map + at))
+    at = ring_take(&vk.stage, bytes, 16);
+    if (!fill_level(t, lvl, vk.stage.map + at))
         return D3DERR_INVALIDCALL;
-    if (!t->img || t->used_frame == vk.frame) {
+    if (remake) {
         retire(t->img, t->mem, t->view);
         t->img = VK_NULL_HANDLE;
-        if (!image_make_levels(t->width, t->height, t->levels, VK_FORMAT_R8G8B8A8_UNORM,
+        if (!image_make_levels(t->width, t->height, t->levels, t->vkfmt,
                                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                                VK_IMAGE_ASPECT_COLOR_BIT, &t->img, &t->mem, &t->view))
             return D3DERR_INVALIDCALL;
@@ -1623,12 +1669,11 @@ static HRESULT __stdcall tex_UnlockRect(IDirect3DTexture8 *s, UINT lvl)
         vk.bound_set = VK_NULL_HANDLE;
         upload_level(t, lvl, at);
         for (other = 0; other < t->levels; other++) {
-            uint32_t ow = t->width >> other ? t->width >> other : 1, oh = t->height >> other ? t->height >> other : 1;
-            VkDeviceSize ob = (VkDeviceSize)ow * oh * 4, oat;
+            VkDeviceSize ob = level_bytes(t, other), oat;
             if (other == lvl || !(t->have & (1u << other)) || ob > vk.stage.size)
                 continue;
-            oat = ring_take(&vk.stage, ob, 4);
-            if (convert_level(t, other, vk.stage.map + oat))
+            oat = ring_take(&vk.stage, ob, 16);
+            if (fill_level(t, other, vk.stage.map + oat))
                 upload_level(t, other, oat);
         }
     } else {
@@ -1894,7 +1939,7 @@ static uint32_t ps_constants(void)
 
 static uint32_t frame_constants(float zscale, const float texscale[2])
 {
-    float f[8];
+    float f[12];
     VkDeviceSize at;
 
     /* Widescreen placement (d3d8_SetDrawPlacement): clip x becomes x * kx + bx, as the
@@ -1908,6 +1953,11 @@ static uint32_t frame_constants(float zscale, const float texscale[2])
     f[5] = texscale ? texscale[1] : 1.0f;
     f[6] = d3d8_GetCanvasScaleY() / d3d8_GetCanvasScaleX();
     f[7] = s_place_kx - s_place_bx;
+    /* PlaceY: y becomes y * (1 + x) + y, so all zero leaves it alone (and is what
+     * a shorter buffer reads back on the Direct3D 11 renderer). */
+    f[8] = s_place_ky - 1.0f;
+    f[9] = s_place_by;
+    f[10] = f[11] = 0.0f;
     at = ring_take(&vk.ubo, sizeof f, vk.ubo_align);
     memcpy(vk.ubo.map + at, f, sizeof f);
     return (uint32_t)at;
@@ -1976,7 +2026,7 @@ static int bind_draw(uint32_t vs, uint8_t layout, uint8_t instanced, VkPrimitive
         VkDescriptorBufferInfo bi[3];
         VkDescriptorImageInfo ii[2 * STAGES];
         VkDescriptorSet set;
-        static const VkDeviceSize range[3] = { sizeof(NV2APSConstants), 192 * 16, 32 };
+        static const VkDeviceSize range[3] = { sizeof(NV2APSConstants), 192 * 16, 48 };
 
         ai.descriptorPool = vk.dpool;
         ai.descriptorSetCount = 1;
@@ -2065,6 +2115,7 @@ void d3d8_SetBlendColor(DWORD argb)
 }
 
 void d3d8_SetDrawPlacement(float kx, float bx) { s_place_kx = kx; s_place_bx = bx; }
+void d3d8_SetDrawPlacementY(float ky, float by) { s_place_ky = ky; s_place_by = by; }
 void d3d8_GetDrawPlacement(float *kx, float *bx) { *kx = s_place_kx; *bx = s_place_bx; }
 /* The blurred side fill is Direct3D 11 only so far: Vulkan presents with a blit.
  * Beside a centred picture the canvas stays black here. */
@@ -2542,6 +2593,9 @@ static int gamma_draw(void)
  * finished -- the line and the arithmetic of the Direct3D 11 backend's
  * d3d8_present_trace_pacing, which the test tooling reads. Without a window
  * these are frames completed, not frames shown. */
+/* [ps5 port] Frames finished so far, for a port's heartbeat line. */
+volatile unsigned g_vk_frames_presented;
+
 static void trace_pacing(void)
 {
     static int on = -1;
@@ -2550,6 +2604,7 @@ static void trace_pacing(void)
     static unsigned n;
     LARGE_INTEGER now;
 
+    g_vk_frames_presented++;
     if (on < 0) {
         const char *e = getenv("RECOMP_PRESENT_PACING");
         on = e && *e == '1';
@@ -2669,6 +2724,74 @@ static int overlay_prepare(uint32_t image)
     return 1;
 }
 
+/* A blurred copy of the picture's 4:3 middle, for a host that fills the sides
+ * beside a 4:3 menu with it: the middle is halved down a chain of blits to
+ * 64x48 and handed to the overlay to draw stretched, faded and darkened. Only
+ * on frames the host asks for, so it costs nothing in a fight. */
+#define BLUR_STEPS 5
+static VkImage s_blur_img[BLUR_STEPS];
+static VkDeviceMemory s_blur_mem[BLUR_STEPS];
+static VkImageView s_blur_view[BLUR_STEPS];
+static int s_blur_state;              /* 0 not made, 1 made, -1 failed */
+static int s_blur_requested;
+static uint32_t s_blur_generation;
+static VkImage s_blur_src;            /* the picture being presented, a transfer source */
+
+void d3d8_vk_request_side_blur(void) { s_blur_requested = 1; }
+
+static int side_blur(void)
+{
+    uint32_t i, bw, x0;
+    VkImageBlit b;
+
+    if (!s_blur_src || !vk.tw || !vk.th)
+        return 0;
+    if (s_blur_state == 0) {
+        for (i = 0; i < BLUR_STEPS; i++)
+            if (!image_make(1024 >> i, 768 >> i, VK_FORMAT_R8G8B8A8_UNORM,
+                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                            (i == BLUR_STEPS - 1 ? VK_IMAGE_USAGE_SAMPLED_BIT : 0),
+                            VK_IMAGE_ASPECT_COLOR_BIT, &s_blur_img[i], &s_blur_mem[i], &s_blur_view[i]))
+                break;
+        s_blur_state = i == BLUR_STEPS ? 1 : -1;
+        s_blur_generation++;
+        fprintf(stderr, "[D3D8-VK] side blur %s\n", s_blur_state > 0 ? "ready" : "unavailable");
+    }
+    if (s_blur_state < 0)
+        return 0;
+    bw = vk.th * 4 / 3;
+    if (bw > vk.tw)
+        bw = vk.tw;
+    x0 = (vk.tw - bw) / 2;
+    for (i = 0; i < BLUR_STEPS; i++)
+        image_layout(vk.cmd, s_blur_img[i], VK_IMAGE_ASPECT_COLOR_BIT,
+                     VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    for (i = 0; i < BLUR_STEPS; i++) {
+        memset(&b, 0, sizeof b);
+        b.srcSubresource.aspectMask = b.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        b.srcSubresource.layerCount = b.dstSubresource.layerCount = 1;
+        if (i == 0) {
+            b.srcOffsets[0].x = (int32_t)x0;
+            b.srcOffsets[1].x = (int32_t)(x0 + bw);
+            b.srcOffsets[1].y = (int32_t)vk.th;
+        } else {
+            image_layout(vk.cmd, s_blur_img[i - 1], VK_IMAGE_ASPECT_COLOR_BIT,
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            b.srcOffsets[1].x = (int32_t)(1024 >> (i - 1));
+            b.srcOffsets[1].y = (int32_t)(768 >> (i - 1));
+        }
+        b.srcOffsets[1].z = 1;
+        b.dstOffsets[1].x = (int32_t)(1024 >> i);
+        b.dstOffsets[1].y = (int32_t)(768 >> i);
+        b.dstOffsets[1].z = 1;
+        vkCmdBlitImage(vk.cmd, i == 0 ? s_blur_src : s_blur_img[i - 1], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       s_blur_img[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
+    }
+    image_layout(vk.cmd, s_blur_img[BLUR_STEPS - 1], VK_IMAGE_ASPECT_COLOR_BIT,
+                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    return 1;
+}
+
 /* Draw the host's overlay on the window's image, which is in transfer-destination
  * layout, and leave it ready to present. Returns 0 (image untouched) when there
  * is nothing to draw. */
@@ -2676,9 +2799,14 @@ static int overlay_draw(uint32_t image)
 {
     VkRenderPassBeginInfo rp = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
     D3D8VkOverlayFrame f;
+    VkOffset3D pic[2];
 
+    int blurred;
+
+    s_blur_requested = 0;
     if (!s_have_overlay || !s_overlay.active(s_overlay.user) || !overlay_prepare(image))
         return 0;
+    blurred = s_blur_requested && side_blur();
     image_layout(vk.cmd, vk.swap_img[image], VK_IMAGE_ASPECT_COLOR_BIT,
                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     rp.renderPass = vk.ov_pass;
@@ -2698,6 +2826,13 @@ static int overlay_draw(uint32_t image)
     f.height = vk.swap_ext.height;
     f.format = (int)vk.swap_fmt;
     f.generation = vk.ov_gen;
+    present_rect(vk.swap_ext.width, vk.swap_ext.height, pic);
+    f.picture_x0 = pic[0].x;
+    f.picture_y0 = pic[0].y;
+    f.picture_x1 = pic[1].x;
+    f.picture_y1 = pic[1].y;
+    f.side_blur = blurred ? (void *)s_blur_view[BLUR_STEPS - 1] : NULL;
+    f.side_blur_generation = s_blur_generation;
     s_overlay.draw(&f, s_overlay.user);
     vkCmdEndRenderPass(vk.cmd);            /* leaves the image presentable */
     return 1;
@@ -2801,12 +2936,242 @@ static void shot_write(void)
     LOG("window picture written to %s (%ux%u)", path, w, h);
 }
 
+/* The title's picture `from` (a transfer source, vk.tw x vk.th) into the
+ * window's image: black around it, the overlay on top. Returns 1 when this
+ * frame's commands carry a window shot. *ov_on is set when the overlay drew
+ * (the frame is then submitted synchronously: the overlay rewrites buffers a
+ * frame in flight reads).
+ * [ps5 port] elripalda's compose(), split out of dev_Present for frame
+ * generation; blz/ps5-1.1.2 adds upstream 1.1.2's present_halve and overlay
+ * wait, which were inline in dev_Present. */
+static int compose(uint32_t image, VkImage from, int *ov_on)
+{
+    VkImageBlit blit;
+    VkClearColorValue black;
+    VkImageSubresourceRange range = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+    memset(&black, 0, sizeof black);
+    black.float32[3] = 1.0f;
+    image_layout(vk.cmd, vk.swap_img[image], VK_IMAGE_ASPECT_COLOR_BIT,
+                 VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    vkCmdClearColorImage(vk.cmd, vk.swap_img[image], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         &black, 1, &range);
+    memset(&blit, 0, sizeof blit);
+    blit.srcSubresource.aspectMask = blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    blit.srcSubresource.layerCount = blit.dstSubresource.layerCount = 1;
+    blit.srcOffsets[1].x = (int32_t)vk.tw;
+    blit.srcOffsets[1].y = (int32_t)vk.th;
+    blit.srcOffsets[1].z = 1;
+    present_rect(vk.swap_ext.width, vk.swap_ext.height, blit.dstOffsets);
+    s_blur_src = from;                  /* the full picture, before any halving */
+    if (s_linear == 2) {
+        uint32_t sw = vk.tw, sh = vk.th;
+        from = present_halve(from, &sw, &sh,
+                             (uint32_t)(blit.dstOffsets[1].x - blit.dstOffsets[0].x),
+                             (uint32_t)(blit.dstOffsets[1].y - blit.dstOffsets[0].y));
+        blit.srcOffsets[1].x = (int32_t)sw;
+        blit.srcOffsets[1].y = (int32_t)sh;
+    }
+    vkCmdBlitImage(vk.cmd, from, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   vk.swap_img[image], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                   s_linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+    if (s_have_overlay && s_overlay.active(s_overlay.user)) {
+        frames_wait_all();              /* the overlay rewrites buffers the frame in flight reads */
+        if (ov_on)
+            *ov_on = 1;
+    }
+    if (overlay_draw(image))
+        return shot_record(image);
+    image_layout(vk.cmd, vk.swap_img[image], VK_IMAGE_ASPECT_COLOR_BIT,
+                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    return 0;
+}
+
+static void present_image(uint32_t image)
+{
+    VkPresentInfoKHR pi = { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
+    LARGE_INTEGER qa, qb;
+    VkResult r;
+
+    pi.swapchainCount = 1;
+    pi.pSwapchains = &vk.swap;
+    pi.pImageIndices = &image;
+    pi.waitSemaphoreCount = 1;
+    pi.pWaitSemaphores = &vk.rdone[image];  /* raised by the submit that drew it */
+    QueryPerformanceCounter(&qa);
+    r = vkQueuePresentKHR(vk.queue, &pi);
+    QueryPerformanceCounter(&qb);
+    g_present_ticks += (uint64_t)(qb.QuadPart - qa.QuadPart);
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR)
+        swapchain_make();
+    trace_pacing();
+}
+
+/* ── Frame generation ─────────────────────────────────────────────────────
+ * With the host's generator (d3d8_vk_set_frame_generator), every frame the
+ * title presents is kept in one of two history images, the generator makes
+ * the picture halfway between the last two, and the window gets that picture
+ * and then the frame: twice the pictures on a display at twice the rate, one
+ * display refresh later than without.
+ *
+ * d3d8_vk_set_frame_generation switches it on and off while the title runs:
+ * off, every frame is shown once again and the images and the generator are
+ * let go (the host puts the display back at the title's rate). On, with a
+ * generator that could not start, each frame is shown twice as it is. */
+static const D3D8VkFrameGen *s_fg;
+static volatile int s_fg_on = 1;
+static struct {
+    int made, failed, have_prev, cur;
+    int gen_made, gen_failed;           /* the generator itself */
+    uint32_t w, h;
+    VkImage hist[2], gen;
+    VkDeviceMemory hist_mem[2], gen_mem;
+    VkImageView hist_view[2], gen_view;
+} s_fgs;
+
+void d3d8_vk_set_frame_generator(const D3D8VkFrameGen *generator) { s_fg = generator; }
+
+void d3d8_vk_set_frame_generation(int on)
+{
+    on = on != 0;
+    if (on && !s_fg_on)
+        s_fgs.failed = s_fgs.gen_failed = 0;    /* asked again: try again */
+    s_fg_on = on;
+}
+
+static void fg_gen_destroy(void)
+{
+    if (!s_fgs.gen_made)
+        return;
+    VKC(vkDeviceWaitIdle(vk.dev));
+    if (s_fg && s_fg->destroy)
+        s_fg->destroy(s_fg->user);
+    s_fgs.gen_made = 0;
+}
+
+static void fg_release(void)
+{
+    int i;
+    fg_gen_destroy();
+    for (i = 0; i < 2; i++)
+        retire(s_fgs.hist[i], s_fgs.hist_mem[i], s_fgs.hist_view[i]);
+    retire(s_fgs.gen, s_fgs.gen_mem, s_fgs.gen_view);
+    memset(&s_fgs, 0, sizeof s_fgs);
+}
+
+/* Whether frames are shown twice (the history images exist); the generator is made or let go
+ * here as the switch says. */
+static int fg_ready(void)
+{
+    int i;
+    if (!s_fg)
+        return 0;
+    if (!s_fg_on) {
+        if (s_fgs.made) {
+            fg_release();
+            LOG("frame generation off: each frame is shown once");
+        }
+        return 0;
+    }
+    if (s_fgs.made && (s_fgs.w != vk.tw || s_fgs.h != vk.th))
+        fg_release();
+    if (!s_fgs.made) {
+        if (s_fgs.failed)
+            return 0;
+        for (i = 0; i < 2; i++)
+            if (!image_make(vk.tw, vk.th, VK_FORMAT_R8G8B8A8_UNORM,
+                            VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                            VK_IMAGE_ASPECT_COLOR_BIT, &s_fgs.hist[i], &s_fgs.hist_mem[i], &s_fgs.hist_view[i]))
+                goto fail;
+        if (!image_make(vk.tw, vk.th, VK_FORMAT_R8G8B8A8_UNORM,
+                        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                        VK_IMAGE_ASPECT_COLOR_BIT, &s_fgs.gen, &s_fgs.gen_mem, &s_fgs.gen_view))
+            goto fail;
+        s_fgs.made = 1;
+        s_fgs.w = vk.tw;
+        s_fgs.h = vk.th;
+    }
+    if (!s_fgs.gen_made && !s_fgs.gen_failed) {
+        if (s_fg->create(s_fg->user, vk.dev, vk.phys, vk.tw, vk.th)) {
+            s_fgs.gen_made = 1;
+            LOG("frame generation on: %ux%u, a picture between every two frames", vk.tw, vk.th);
+        } else {
+            s_fgs.gen_failed = 1;
+            LOG("frame generation could not start; each frame is shown twice as it is");
+        }
+    }
+    return 1;
+fail:
+    LOG("frame generation could not start; frames are shown as they are");
+    fg_release();
+    s_fgs.failed = 1;
+    return 0;
+}
+
+/* `from` (a transfer source) into the history image `slot`, left sampled. */
+static void fg_capture(VkImage from, int slot)
+{
+    VkImageCopy c;
+    memset(&c, 0, sizeof c);
+    c.srcSubresource.aspectMask = c.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    c.srcSubresource.layerCount = c.dstSubresource.layerCount = 1;
+    c.extent.width = vk.tw;
+    c.extent.height = vk.th;
+    c.extent.depth = 1;
+    image_layout(vk.cmd, s_fgs.hist[slot], VK_IMAGE_ASPECT_COLOR_BIT,
+                 VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    vkCmdCopyImage(vk.cmd, from, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   s_fgs.hist[slot], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+    image_layout(vk.cmd, s_fgs.hist[slot], VK_IMAGE_ASPECT_COLOR_BIT,
+                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+}
+
+/* The picture halfway between the history images `prev` and `next`, left a transfer source. */
+static void fg_make(int prev, int next)
+{
+    image_layout(vk.cmd, s_fgs.gen, VK_IMAGE_ASPECT_COLOR_BIT,
+                 VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    s_fg->generate(s_fg->user, vk.cmd, s_fgs.hist_view[prev], s_fgs.hist_view[next], s_fgs.gen_view, 0.5f);
+    image_layout(vk.cmd, s_fgs.gen, VK_IMAGE_ASPECT_COLOR_BIT,
+                 VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+}
+
+/* The real frame, from history image `slot`, after the generated one: a frame of its own. */
+static void fg_present_real(int slot)
+{
+    uint32_t image = 0;
+    VkResult r;
+    LARGE_INTEGER qa, qb;
+
+    frame_begin();
+    QueryPerformanceCounter(&qa);
+    r = vkAcquireNextImageKHR(vk.dev, vk.swap, 20 * 1000 * 1000ull, vk.acquired, VK_NULL_HANDLE, &image);
+    QueryPerformanceCounter(&qb);
+    g_acquire_ticks += (uint64_t)(qb.QuadPart - qa.QuadPart);
+    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
+        frame_submit();
+        if (r == VK_ERROR_OUT_OF_DATE_KHR)
+            swapchain_make();
+        return;
+    }
+    {
+        int ov_on = 0;
+        image_layout(vk.cmd, s_fgs.hist[slot], VK_IMAGE_ASPECT_COLOR_BIT,
+                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        compose(image, s_fgs.hist[slot], &ov_on);
+        image_layout(vk.cmd, s_fgs.hist[slot], VK_IMAGE_ASPECT_COLOR_BIT,
+                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        frame_submit_ex(vk.acquired, vk.rdone[image], ov_on);
+    }
+    present_image(image);
+}
+
 static HRESULT __stdcall dev_Present(IDirect3DDevice8 *s, const RECT *src, const RECT *dst,
                                      HWND wnd, void *dirty)
 {
     uint32_t image = 0;
     VkResult r;
-    int have = 0, shot = 0, ov_on = 0;
+    int have = 0, shot = 0, ov_on = 0, real = -1;
     /* RECOMP_VK_SYNC=1: wait for each frame before going on, as before frames were overlapped. */
     static int force_sync = -1;
 
@@ -2866,50 +3231,29 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *s, const RECT *src, const
         /* VK_NOT_READY, VK_TIMEOUT: no image free; this frame is not shown. */
     }
     if (have) {
-        VkImageBlit blit;
-        VkClearColorValue black;
-        VkImageSubresourceRange range = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-
         VkImage from = vk.color;
         int ramped = gamma_draw();
 
-        memset(&black, 0, sizeof black);
-        black.float32[3] = 1.0f;
         if (ramped)
             from = vk.final;                /* already a transfer source */
         else
             image_layout(vk.cmd, vk.color, VK_IMAGE_ASPECT_COLOR_BIT,
                          VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-        image_layout(vk.cmd, vk.swap_img[image], VK_IMAGE_ASPECT_COLOR_BIT,
-                     VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        vkCmdClearColorImage(vk.cmd, vk.swap_img[image], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                             &black, 1, &range);
-        memset(&blit, 0, sizeof blit);
-        blit.srcSubresource.aspectMask = blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        blit.srcSubresource.layerCount = blit.dstSubresource.layerCount = 1;
-        blit.srcOffsets[1].x = (int32_t)vk.tw;
-        blit.srcOffsets[1].y = (int32_t)vk.th;
-        blit.srcOffsets[1].z = 1;
-        present_rect(vk.swap_ext.width, vk.swap_ext.height, blit.dstOffsets);
-        if (s_linear == 2) {
-            uint32_t sw = vk.tw, sh = vk.th;
-            from = present_halve(from, &sw, &sh,
-                                 (uint32_t)(blit.dstOffsets[1].x - blit.dstOffsets[0].x),
-                                 (uint32_t)(blit.dstOffsets[1].y - blit.dstOffsets[0].y));
-            blit.srcOffsets[1].x = (int32_t)sw;
-            blit.srcOffsets[1].y = (int32_t)sh;
+        if (fg_ready()) {
+            int cur = s_fgs.cur, prev = 1 - cur;
+            fg_capture(from, cur);
+            if (s_fgs.gen_made && s_fgs.have_prev) {
+                fg_make(prev, cur);
+                shot = compose(image, s_fgs.gen, &ov_on);
+            } else {
+                shot = compose(image, from, &ov_on);
+            }
+            real = cur;                     /* then the frame (again, without the generator) */
+            s_fgs.have_prev = 1;
+            s_fgs.cur = prev;
+        } else {
+            shot = compose(image, from, &ov_on);
         }
-        vkCmdBlitImage(vk.cmd, from, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                       vk.swap_img[image], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
-                       s_linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
-        ov_on = s_have_overlay && s_overlay.active(s_overlay.user);
-        if (ov_on)
-            frames_wait_all();              /* the overlay rewrites buffers the frame in flight reads */
-        if (overlay_draw(image))
-            shot = shot_record(image);
-        else
-            image_layout(vk.cmd, vk.swap_img[image], VK_IMAGE_ASPECT_COLOR_BIT,
-                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
         if (!ramped)
             image_layout(vk.cmd, vk.color, VK_IMAGE_ASPECT_COLOR_BIT,
                          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
@@ -2919,20 +3263,9 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *s, const RECT *src, const
     if (shot && s_shot_pending)
         shot_write();
     if (have) {
-        VkPresentInfoKHR pi = { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
-        pi.swapchainCount = 1;
-        pi.pSwapchains = &vk.swap;
-        pi.pImageIndices = &image;
-        pi.waitSemaphoreCount = 1;
-        pi.pWaitSemaphores = &vk.rdone[image];
-        LARGE_INTEGER qa, qb;
-        QueryPerformanceCounter(&qa);
-        r = vkQueuePresentKHR(vk.queue, &pi);
-        QueryPerformanceCounter(&qb);
-        g_present_ticks += (uint64_t)(qb.QuadPart - qa.QuadPart);
-        if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR)
-            swapchain_make();
-        trace_pacing();
+        present_image(image);
+        if (real >= 0)
+            fg_present_real(real);
     } else if (vk.swap && s_have_host && s_host.drawable_size) {
         /* A window that changed size without the swap chain saying so. */
         int w = 0, h = 0;
@@ -3478,6 +3811,33 @@ static int device_make(void)
             vk.max_anisotropy = props.limits.maxSamplerAnisotropy;
         }
         LOG("anisotropic filtering: up to %.0fx", (double)vk.max_anisotropy);
+        {
+            /* [ps5 port] BC sampling, for keeping the title's DXT textures (and
+             * compressed texture packs) compressed on the GPU.
+             * RECOMP_VK_NATIVE_BC=0 decodes them instead. Same feature struct as
+             * the anisotropy request above (one pEnabledFeatures). */
+            const char *e = getenv("RECOMP_VK_NATIVE_BC");
+            vk.bc = 0;
+            if (have.textureCompressionBC && !(e && e[0] == '0')) {
+                static const VkFormat bcs[3] = { VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_FORMAT_BC2_UNORM_BLOCK,
+                                                 VK_FORMAT_BC3_UNORM_BLOCK };
+                VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT
+                                          | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT
+                                          | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+                int f, ok = 1;
+                for (f = 0; f < 3; f++) {
+                    VkFormatProperties fp;
+                    vkGetPhysicalDeviceFormatProperties(vk.phys, bcs[f], &fp);
+                    if ((fp.optimalTilingFeatures & need) != need)
+                        ok = 0;
+                }
+                if (ok) {
+                    want.textureCompressionBC = VK_TRUE;
+                    vk.bc = 1;
+                }
+            }
+            LOG("DXT textures %s", vk.bc ? "stay compressed on the GPU (BC1/2/3)" : "are decoded to RGBA8");
+        }
         dci.pEnabledFeatures = &want;
     }
     dci.queueCreateInfoCount = 1;

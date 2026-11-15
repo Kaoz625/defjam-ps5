@@ -31,10 +31,17 @@ static const char *const k_aniso[] = { "off", "2x", "4x", "8x", "16x", NULL };
 static const char *const k_msaa[] = { "off", "2x", "4x", "8x", NULL };
 static const char *const k_ws_hud[] = { "auto", "edges", "centered", NULL };
 static const char *const k_ws_cutscenes[] = { "authored", "fill", NULL };
+#if defined(__PROSPERO__)
+/* [ps5 port] "border": a picture beside 4:3 menus (borders/ in the app folder), which goes away
+ * as soon as the game draws its own 3D there; which picture is [display] border. */
+static const char *const k_ws_fill[] = { "blur", "black", "border", NULL };
+static const char *const k_border[] = { "logo", "red", "gold", "plain", NULL };
+#else
 static const char *const k_ws_fill[] = { "blur", "black", NULL };
+#endif
 
 static RecompSetting g_display_settings[] = {
-    { "textures", "enabled", RECOMP_SETTING_BOOL, 0, 0, 0, NULL, NULL, RECOMP_SETTING_RESTART,
+    { "textures", "enabled", RECOMP_SETTING_BOOL, PC_DEFAULT_TEXTURES, 0, 0, NULL, NULL, RECOMP_SETTING_RESTART,
       "Use texture packs from the data folder's mods directory." },
     { "textures", "packs", RECOMP_SETTING_STRING, 0, 0, 0, NULL, "RECOMP_TEXTURE_PACKS", RECOMP_SETTING_RESTART,
       "Pack folder names separated by semicolons. Later packs take precedence.", "faithful-hd" },
@@ -52,18 +59,26 @@ static RecompSetting g_display_settings[] = {
     { "display", "window_width", RECOMP_SETTING_INT, 1920, 320, 16384, NULL, NULL, 0,
       "Window size when not full screen. Resizing the window updates these." },
     { "display", "window_height", RECOMP_SETTING_INT, 1080, 240, 16384, NULL, NULL, 0, NULL },
-    { "display", "aspect", RECOMP_SETTING_ENUM, 2, 0, 0, k_aspect, "RECOMP_ASPECT", 0,
+    { "display", "aspect", RECOMP_SETTING_ENUM, PC_DEFAULT_ASPECT, 0, 0, k_aspect, "RECOMP_ASPECT", 0,
       "4:3 keeps the console's picture shape with black bars; stretch fills the window; the widescreen shapes "
       "(beta) widen the 3D view and keep menus, HUD and movies in shape, and start with the game." },
     { "display", "widescreen_hud", RECOMP_SETTING_ENUM, 0, 0, 0, k_ws_hud, NULL, RECOMP_SETTING_RESTART,
       "Where the fight HUD goes in widescreen: the screen edges, or a centred 16:9 box (auto: edges up to 16:9)." },
     { "display", "widescreen_cutscenes", RECOMP_SETTING_ENUM, 0, 0, 0, k_ws_cutscenes, NULL, RECOMP_SETTING_RESTART,
       "Story cutscenes in widescreen: authored keeps the game's own 16:9 framing, fill always fills the screen." },
+#if defined(__PROSPERO__)
+    { "display", "widescreen_side_fill", RECOMP_SETTING_ENUM, PC_DEFAULT_SIDE_FILL, 0, 0, k_ws_fill, NULL,
+      RECOMP_SETTING_RESTART,
+      "Beside 4:3 pictures (menus, movies, loading screens) in widescreen: a soft blurred extension, black, or a "
+      "border picture (borders/border.png in the game's folder), which goes away as soon as the game draws its "
+      "own 3D there." },
+#else
     { "display", "widescreen_side_fill", RECOMP_SETTING_ENUM, 0, 0, 0, k_ws_fill, NULL, RECOMP_SETTING_RESTART,
       "Beside 4:3 pictures (movies, menu backgrounds) in widescreen: a soft blurred extension, or black." },
+#endif
     { "display", "widescreen_fov_cap", RECOMP_SETTING_INT, 150, 90, 170, NULL, NULL, RECOMP_SETTING_RESTART,
       "Widest horizontal field of view widescreen may use, in degrees (only very wide screens reach it)." },
-    { "display", "render_scale", RECOMP_SETTING_INT, 2, 1, 4, NULL, "RECOMP_RENDER_SCALE",
+    { "display", "render_scale", RECOMP_SETTING_INT, PC_DEFAULT_RENDER_SCALE, 1, 4, NULL, "RECOMP_RENDER_SCALE",
       RECOMP_SETTING_RESTART,
       "Internal render height: 1x = 480p, 2x = 960p, 3x = 1440p, 4x = 1920p. "
       "1080p output: 2x balances speed and clarity; 3x is sharper. 1440p output: 3x. "
@@ -98,6 +113,24 @@ static RecompSetting g_display_settings[] = {
       "(100); 0 shows the picture untinted." },
     { "display", "scratches", RECOMP_SETTING_BOOL, 1, 0, 0, NULL, "RECOMP_SCRATCHES", 0,
       "The film scratches some scenes draw over the picture. Off removes them." },
+#if defined(__PROSPERO__)
+    /* [ps5 port] the console's own settings (elripalda/defjam-ps5) */
+    { "display", "output_4k", RECOMP_SETTING_BOOL, 1, 0, 0, NULL, NULL, RECOMP_SETTING_RESTART,
+      "Send 3840x2160 to the TV when it takes it; off, or a TV without it, gets 1920x1080." },
+    { "ps5", "defaults", RECOMP_SETTING_INT, 0, 0, 1000, NULL, NULL, 0,
+      "Which set of console defaults this file has been brought up to. Leave it as it is." },
+    { "display", "sharp_text", RECOMP_SETTING_BOOL, 1, 0, 0, NULL, NULL, RECOMP_SETTING_RESTART,
+      "Redraw the game's menu text at four times its size with clean edges, instead of stretching it." },
+    { "display", "border", RECOMP_SETTING_ENUM, 0, 0, 0, k_border, NULL, RECOMP_SETTING_RESTART,
+      "Which picture fills the sides with the border: borders/border-logo.png, -red, -gold or border.png." },
+    { "textures", "menus", RECOMP_SETTING_BOOL, 0, 0, 0, NULL, NULL, 0,
+      "The AI-remastered menus and HUD (mods/hd-menus), off unless you turn it on. The HD textures switch covers the other packs." },
+    { "textures", "compress", RECOMP_SETTING_BOOL, 1, 0, 0, NULL, NULL, 0,
+      "Keep the HD textures compressed (DXT): a quarter of the memory, and a copy in texture-cache/ so they load "
+      "faster the next time. Off keeps every pixel exactly as the pack has it." },
+    { "display", "frame_gen", RECOMP_SETTING_BOOL, 0, 0, 0, NULL, NULL, 0,
+      "Beta: a generated picture between every two frames, with the TV at 120 Hz (MihawkGen). Off puts the TV back at 60." },
+#endif
 };
 #define DISPLAY_SETTING_COUNT (sizeof(g_display_settings) / sizeof(g_display_settings[0]))
 
@@ -167,6 +200,9 @@ int pc_settings_open(const char *path)
 
     snprintf(g_path, sizeof g_path, "%s", path ? path : "");
     recomp_settings_register(g_settings, count);
+#if defined(__PROSPERO__)
+    fprintf(stderr, "[PS5] settings: settings registered\n");
+#endif
     recomp_settings_set_log(settings_log);
     read = g_path[0] ? recomp_settings_load(g_path) : 0;
     if (!g_path[0])
@@ -201,13 +237,14 @@ void pc_settings_save(void) { (void)pc_settings_save_checked(); }
 /* Keep this ownership list identical for both directions. HD is a separate optional install;
  * Original disables replacements without deleting packs. Modern preserves their selection. */
 static const struct { const char *key; int original, modern; } k_experience[] = {
-    {"aspect", 0, 2}, {"render_scale", 1, 2}, {"filter", 0, 2},
+    /* [ps5 port] "modern" on the console is its own defaults (16:9, 4x, the border). */
+    {"aspect", 0, PC_DEFAULT_ASPECT}, {"render_scale", 1, PC_DEFAULT_RENDER_SCALE}, {"filter", 0, 2},
     {"msaa", 1, 1}, {"texture_mips", 1, 1}, {"anisotropy", 0, 4},
     {"vsync", 1, 1}, {"gamma", 1, 1}, {"brightness", 100, 100},
     {"vignette", 1, 1}, {"vignette_strength", 100, 100},
     {"color_tint", 100, 100}, {"scratches", 1, 1},
     {"widescreen_hud", 0, 0}, {"widescreen_cutscenes", 0, 0},
-    {"widescreen_side_fill", 0, 0}, {"widescreen_fov_cap", 150, 150}
+    {"widescreen_side_fill", 0, PC_DEFAULT_SIDE_FILL}, {"widescreen_fov_cap", 150, 150}
 };
 int pc_experience_current(void)
 {

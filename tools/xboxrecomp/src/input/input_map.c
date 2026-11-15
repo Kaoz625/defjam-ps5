@@ -305,8 +305,17 @@ void xbox_InputMap_PadMapDefaults(InputPadMap *m)
     memcpy(m->source, identity, sizeof(identity));
     m->left_stick = INPUT_STICK_LEFT;
     m->right_stick = INPUT_STICK_RIGHT;
+#if defined(__PROSPERO__)
+    /* [ps5 port] The title has its own dead zone (0.25 per axis, rescaled,
+     * like the console pad it was made for), and a DualSense at rest stays
+     * well inside it (at most 0.07). A second 15% here made a direction need
+     * 62% of the stick's travel instead of 55%. */
+    m->deadzone_left = 0;
+    m->deadzone_right = 0;
+#else
     m->deadzone_left = 15;
     m->deadzone_right = 15;
+#endif
     m->trigger_threshold = 5;
     m->button_threshold = 50;
 }

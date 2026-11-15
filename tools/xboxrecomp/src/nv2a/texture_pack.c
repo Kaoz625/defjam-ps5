@@ -23,11 +23,28 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <dirent.h>
 #if defined(__linux__)
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #endif
 #define _stricmp strcasecmp
+#endif
+
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-function"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#endif
+#define STB_DXT_IMPLEMENTATION
+#define STB_DXT_STATIC
+#include "stb/stb_dxt.h"
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
 #endif
 
 #define MAX_ENTRIES 65536
@@ -48,6 +65,7 @@ typedef struct PackEntry {
     char anchor[65];
     int dt;
     int inner;               /* "inner:" slab: also replaces the anchor itself in widescreen */
+    unsigned char veto_checked, vetoed;     /* the renderer keeps this one (texture_pack_set_veto) */
 } PackEntry;
 static PackEntry *g_entries;
 static size_t g_count, g_capacity;
@@ -94,6 +112,29 @@ static char g_dump[PATH_CAP];
 static uint64_t g_budget, g_resident, g_clock, g_hits, g_misses, g_hashed, g_dumps;
 static unsigned g_errors,g_loads;
 static int g_trace, g_sync_load;
+/* RECOMP_TEXTURE_COMPRESS=1: PNG replacements are compressed to DXT1 (opaque) or DXT5 on the
+ * decoding threads, a quarter or an eighth of their memory. RECOMP_TEXTURE_DISK_CACHE=<dir> keeps
+ * what that made, so the next time the PNG is not decoded again (RECOMP_TEXTURE_DISK_CACHE_MB caps it). */
+static int g_compress;
+static char g_disk[PATH_CAP];
+static uint64_t g_disk_cap;
+static volatile int64_t g_disk_used, g_disk_hits, g_disk_writes;   /* the decoding threads add to these */
+#if defined(_WIN32)
+#define DISK_ADD(var,v) InterlockedExchangeAdd64((volatile LONG64 *)&(var),(LONG64)(v))
+#else
+#define DISK_ADD(var,v) __atomic_fetch_add(&(var),(int64_t)(v),__ATOMIC_RELAXED)
+#endif
+/* RECOMP_TEXTURE_LOG_SEEN=1: one line per distinct big texture the title draws (id, size, format),
+ * to find the id of a picture a pack should replace. */
+static int g_log_seen;
+/* [scale] in a manifest: id=factor. The title draws that texture's 2D batch that many times larger,
+ * around its own centre (a logo made bigger than its box). Asked for through texture_pack_bound_scale. */
+static struct { char id[65]; float scale; } g_scales[64];
+static unsigned g_scale_count;
+static float g_bound_scale = 1.0f;
+static uint32_t g_bound_scale_address;
+static unsigned g_seen_count;
+static uint64_t g_seen_ids[1024];
 /* Counted over two seconds and logged with the frame rate, so a play log shows what the packs cost. */
 static struct { ULONGLONG start; unsigned loads, evictions, rejected, max_ms, revalidated, full_hashes; uint64_t ms, bytes, revalidated_bytes; } g_win;
 
@@ -104,6 +145,9 @@ static void make_directories(const char *path);
 static int memory_readable(const void *data, uint64_t bytes);
 static int write_png(const char *path, const uint8_t *bgra, uint32_t w, uint32_t h);
 static uint8_t *read_png(const char *path, uint32_t *w, uint32_t *h, int *retry);
+static int file_stamp(const char *path, uint64_t *size, uint64_t *mtime);
+static int replace_file(const char *from, const char *to);
+static uint64_t folder_bytes(const char *dir);
 typedef struct Sha Sha;
 #if defined(_WIN32)
 struct Sha { BCRYPT_HASH_HANDLE hash; };
@@ -256,6 +300,14 @@ static void read_pack(const char *root, const char *name)
             else mips_valid=0;
         }
         if(!strcmp(section,"wide")) { read_wide(root,name,path,s,equal); continue; }
+        if(!strcmp(section,"scale")) {
+            float f=(float)atof(equal);
+            if(valid_id(s) && f>=0.25f && f<=4.0f && g_scale_count<64) {
+                for(end=s;*end;end++) *end=(char)tolower((unsigned char)*end);
+                memcpy(g_scales[g_scale_count].id,s,65); g_scales[g_scale_count++].scale=f;
+            }
+            continue;
+        }
         if(strcmp(section,"textures")) continue;
         if(!valid_id(s) || !valid_name(equal,1)) { warn("Invalid texture entry",s); continue; }
         end=strrchr(equal,'.');
@@ -306,6 +358,13 @@ static void initialize(void)
     g_budget=(uint64_t)mb*1024*1024;
     g_sync_load=(e=getenv("RECOMP_TEXTURE_SYNC")) && *e && *e!='0';
     g_trace=(e=getenv("RECOMP_TEXTURE_TRACE")) && *e && *e!='0';
+    g_log_seen=(e=getenv("RECOMP_TEXTURE_LOG_SEEN")) && *e && *e!='0';
+    g_compress=(e=getenv("RECOMP_TEXTURE_COMPRESS")) && *e && *e!='0';
+    g_disk[0]=0;
+    if(g_compress && (e=getenv("RECOMP_TEXTURE_DISK_CACHE")) && *e) snprintf(g_disk,sizeof g_disk,"%s",e);
+    { long cap=(e=getenv("RECOMP_TEXTURE_DISK_CACHE_MB")) ? strtol(e,NULL,10) : 4096;
+      if(cap<0) cap=0;
+      g_disk_cap=(uint64_t)cap*1024*1024; }
     e=getenv("RECOMP_TEXTURE_DUMP_DIR"); if(e && *e) snprintf(g_dump,sizeof g_dump,"%s",e);
     if((e=getenv("RECOMP_TEXTURE_DUMP_LIMIT"))) {
         g_dump_limit=atoi(e); if(g_dump_limit<0) g_dump_limit=0; if(g_dump_limit>65536) g_dump_limit=65536;
@@ -320,10 +379,18 @@ static void initialize(void)
     if(g_active) {
         host_init();
         if(g_dump[0]) make_directories(g_dump);
-        fprintf(stderr,"[TEXPACK] schema=1 entries=%zu wide=%zu stretch=%zu cache=%ld MiB dump=%s\n",g_count,g_wide_count,g_stretch_count,mb,g_dump);
+        if(g_disk[0]) { make_directories(g_disk); g_disk_used=(int64_t)folder_bytes(g_disk); }
+        fprintf(stderr,"[TEXPACK] schema=1 entries=%zu wide=%zu stretch=%zu cache=%ld MiB dump=%s compress=%d disk=%s (%llu of %llu MiB)\n",g_count,g_wide_count,g_stretch_count,mb,g_dump,
+                g_compress,g_disk[0] ? g_disk : "off",(unsigned long long)(g_disk_used>>20),(unsigned long long)(g_disk_cap>>20));
     }
 }
 int texture_pack_active(void) { initialize(); return g_active; }
+float texture_pack_scale_for(uint32_t address) { return address == g_bound_scale_address ? g_bound_scale : 1.0f; }
+
+/* A texture the renderer draws better itself (sharpened text) keeps its own path
+ * even when a pack has it. Asked once per replacement. */
+static int (*g_veto)(const RecompTextureSource *, RecompTextureSample, void *);
+void texture_pack_set_veto(int (*veto)(const RecompTextureSource *, RecompTextureSample, void *)) { g_veto = veto; }
 
 static int readable(const void *data,uint64_t bytes)
 {
@@ -450,9 +517,10 @@ static int valid_scale(uint32_t w,uint32_t h,const RecompTextureSource *s)
  * touches no D3D object, so a worker thread can build it. */
 typedef struct Prepared {
     uint32_t w,h,levels;
+    uint32_t fmt;               /* 0: BGRA levels; D3DFMT_DXT1 or D3DFMT_DXT5: blocks */
     uint64_t memory;
     uint8_t *level[16];
-    uint32_t lw[16],lh[16];
+    uint32_t lw[16],lh[16],bytes[16];
 } Prepared;
 static void prepared_free(Prepared *p)
 {
@@ -461,16 +529,117 @@ static void prepared_free(Prepared *p)
     for(i=0;i<16;i++) free(p->level[i]);
     free(p);
 }
+/* ---- Compressing a decoded replacement, and keeping the result on disk. ---- */
+static uint8_t *compress_level(const uint8_t *bgra,uint32_t w,uint32_t h,int alpha,uint32_t *bytes)
+{
+    uint32_t bw=(w+3)/4,bh=(h+3)/4,bb=alpha?16:8,bx,by,x,y;
+    uint8_t *out=malloc((size_t)bw*bh*bb),block[64];
+    if(!out) return NULL;
+    for(by=0;by<bh;by++) for(bx=0;bx<bw;bx++) {
+        for(y=0;y<4;y++) {
+            uint32_t sy=by*4+y<h ? by*4+y : h-1;
+            for(x=0;x<4;x++) {
+                uint32_t sx=bx*4+x<w ? bx*4+x : w-1;
+                const uint8_t *q=bgra+((size_t)sy*w+sx)*4; uint8_t *d=block+(y*4+x)*4;
+                d[0]=q[2]; d[1]=q[1]; d[2]=q[0]; d[3]=alpha ? q[3] : 255;
+            }
+        }
+        stb_compress_dxt_block(out+((size_t)by*bw+bx)*bb,block,alpha,STB_DXT_HIGHQUAL);
+    }
+    *bytes=bw*bh*bb;
+    return out;
+}
+/* Every level to DXT1 when the picture is opaque, else DXT5. 0 leaves it as it was. A top level
+ * that is not a multiple of four stays BGRA (Direct3D 11 refuses such a BC texture). */
+static int compress_prepared(Prepared *p)
+{
+    uint32_t level,alpha=0; size_t i,count;
+    uint8_t *packed[16]={0}; uint32_t bytes[16]={0}; uint64_t memory=0;
+    if(p->fmt || (p->w&3) || (p->h&3)) return 0;
+    count=(size_t)p->w*p->h;
+    for(i=0;i<count;i++) if(p->level[0][i*4+3]!=255) { alpha=1; break; }
+    for(level=0;level<p->levels;level++) {
+        packed[level]=compress_level(p->level[level],p->lw[level],p->lh[level],(int)alpha,&bytes[level]);
+        if(!packed[level]) { while(level--) free(packed[level]); return 0; }
+        memory+=(uint64_t)bytes[level]*2;
+    }
+    for(level=0;level<p->levels;level++) { free(p->level[level]); p->level[level]=packed[level]; p->bytes[level]=bytes[level]; }
+    p->fmt=alpha ? D3DFMT_DXT5 : D3DFMT_DXT1; p->memory=memory;
+    return 1;
+}
+typedef struct DiskHeader {
+    char magic[4]; uint32_t version;
+    uint32_t fmt,w,h,levels,src_w,src_h,row_texels,channel_mips;
+    uint64_t png_size,png_mtime,total;
+    uint32_t bytes[16];
+} DiskHeader;
+static void disk_name(char out[PATH_CAP],const char *id,const char *path)
+{
+    uint64_t f=1469598103934665603ull; const unsigned char *c;
+    for(c=(const unsigned char *)path;*c;c++) { f^=*c; f*=1099511628211ull; }
+    snprintf(out,PATH_CAP,"%s/%.64s-%016llx.bct",g_disk,id,(unsigned long long)f);
+}
+static Prepared *disk_read(const char *file,uint32_t src_w,uint32_t src_h,uint32_t row_texels,int channel_mips,uint64_t png_size,uint64_t png_mtime)
+{
+    FILE *f=fopen(file,"rb"); DiskHeader h; Prepared *p; uint32_t level; uint64_t sum=0;
+    if(!f) return NULL;
+    if(fread(&h,sizeof h,1,f)!=1 || memcmp(h.magic,"XRBC",4) || h.version!=1 || h.src_w!=src_w || h.src_h!=src_h ||
+       h.row_texels!=row_texels || h.channel_mips!=(uint32_t)channel_mips || h.png_size!=png_size || h.png_mtime!=png_mtime ||
+       (h.fmt!=D3DFMT_DXT1 && h.fmt!=D3DFMT_DXT5) || !h.levels || h.levels>15 || !h.w || !h.h || h.w>16384 || h.h>16384) { fclose(f); return NULL; }
+    for(level=0;level<h.levels;level++) {
+        uint32_t lw=h.w>>level?h.w>>level:1,lh=h.h>>level?h.h>>level:1;
+        if(h.bytes[level]!=((lw+3)/4)*((lh+3)/4)*(h.fmt==D3DFMT_DXT1?8u:16u)) { fclose(f); return NULL; }
+        sum+=h.bytes[level];
+    }
+    if(sum!=h.total || sum*2>g_budget) { fclose(f); return NULL; }
+    p=calloc(1,sizeof *p);
+    if(!p) { fclose(f); return NULL; }
+    p->w=h.w; p->h=h.h; p->levels=h.levels; p->fmt=h.fmt; p->memory=sum*2;
+    for(level=0;level<h.levels;level++) {
+        p->lw[level]=h.w>>level?h.w>>level:1; p->lh[level]=h.h>>level?h.h>>level:1; p->bytes[level]=h.bytes[level];
+        p->level[level]=malloc(h.bytes[level]);
+        if(!p->level[level] || fread(p->level[level],1,h.bytes[level],f)!=h.bytes[level]) { fclose(f); prepared_free(p); return NULL; }
+    }
+    fclose(f);
+    return p;
+}
+static void disk_write(const char *file,const Prepared *p,uint32_t src_w,uint32_t src_h,uint32_t row_texels,int channel_mips,uint64_t png_size,uint64_t png_mtime)
+{
+    char part[PATH_CAP+32]; FILE *f; DiskHeader h; uint32_t level; int ok;
+    uint64_t total=0;
+    for(level=0;level<p->levels;level++) total+=p->bytes[level];
+    if((uint64_t)g_disk_used+total+sizeof h>g_disk_cap) return;
+    memset(&h,0,sizeof h);
+    memcpy(h.magic,"XRBC",4); h.version=1; h.fmt=p->fmt; h.w=p->w; h.h=p->h; h.levels=p->levels;
+    h.src_w=src_w; h.src_h=src_h; h.row_texels=row_texels; h.channel_mips=(uint32_t)channel_mips;
+    h.png_size=png_size; h.png_mtime=png_mtime; h.total=total;
+    for(level=0;level<p->levels;level++) h.bytes[level]=p->bytes[level];
+    snprintf(part,sizeof part,"%s.%p.part",file,(const void *)p);
+    f=fopen(part,"wb");
+    if(!f) { static int said; if(!said++) warn("Texture cache not writable",part); return; }
+    ok=fwrite(&h,sizeof h,1,f)==1;
+    for(level=0;ok && level<p->levels;level++) ok=fwrite(p->level[level],1,p->bytes[level],f)==p->bytes[level];
+    if(fclose(f)!=0) ok=0;
+    if(!ok || !replace_file(part,file)) { remove(part); return; }
+    DISK_ADD(g_disk_used,total+sizeof h); DISK_ADD(g_disk_writes,1);
+}
+
 /* Decode, pad to the guest's row length and build the mips. Returns NULL for a replacement that
  * is rejected (*retry 0) or that failed for a reason that can clear (*retry 1). */
-static Prepared *prepare_png(const char *path,uint32_t src_w,uint32_t src_h,uint32_t row_texels,int channel_mips,int *retry)
+static Prepared *prepare_png(const char *id,const char *path,uint32_t src_w,uint32_t src_h,uint32_t row_texels,int channel_mips,int *retry)
 {
     uint32_t w=0,h=0,physical_w,levels=1,dim,y,x,level;
     uint8_t *data,*padded=NULL;
     Prepared *out;
     RecompTextureSource shape={0};
+    char cached[PATH_CAP]; uint64_t png_size=0,png_mtime=0;
+    int disk=g_compress && g_disk[0] && id && file_stamp(path,&png_size,&png_mtime);
     shape.width=src_w; shape.height=src_h;
     *retry=0;
+    if(disk) {
+        disk_name(cached,id,path);
+        if((out=disk_read(cached,src_w,src_h,row_texels,channel_mips,png_size,png_mtime))!=NULL) { DISK_ADD(g_disk_hits,1); return out; }
+    }
     data=read_png(path,&w,&h,retry);
     if(!data) return NULL;
     if(!valid_scale(w,h,&shape)) { free(data); return NULL; }
@@ -516,6 +685,8 @@ static Prepared *prepare_png(const char *path,uint32_t src_w,uint32_t src_h,uint
             data=next; w=nw; h=nh;
         }
     }
+    for(level=0;level<levels;level++) out->bytes[level]=out->lw[level]*out->lh[level]*4;
+    if(g_compress && compress_prepared(out) && disk) disk_write(cached,out,src_w,src_h,row_texels,channel_mips,png_size,png_mtime);
     return out;
 }
 /* Create the texture and copy the chain in. D3D calls: the render thread only. 1 done, -1 retry later. */
@@ -523,13 +694,17 @@ static int commit_prepared(IDirect3DDevice8 *dev,PackEntry *e,const Prepared *p)
 {
     IDirect3DTexture8 *texture=NULL; uint32_t level,y;
     ULONGLONG t0=now_ms(),t1,t2,t3;
-    if(!make_room(dev,p->memory) || FAILED(dev->lpVtbl->CreateTexture(dev,p->w,p->h,p->levels,0,D3DFMT_LIN_A8R8G8B8,0,&texture))) return -1;
+    D3DFORMAT fmt=p->fmt ? (D3DFORMAT)p->fmt : D3DFMT_LIN_A8R8G8B8;
+    if(!make_room(dev,p->memory) || FAILED(dev->lpVtbl->CreateTexture(dev,p->w,p->h,p->levels,0,fmt,0,&texture))) return -1;
     t1=now_ms(); t2=t3=0;
     for(level=0;level<p->levels;level++) {
-        D3DLOCKED_RECT lock={0}; uint32_t w=p->lw[level],h=p->lh[level];
+        D3DLOCKED_RECT lock={0};
+        /* A row of texels, or of 4x4 blocks. */
+        uint32_t row=p->fmt ? ((p->lw[level]+3)/4)*(p->fmt==D3DFMT_DXT1?8u:16u) : p->lw[level]*4;
+        uint32_t rows=p->fmt ? (p->lh[level]+3)/4 : p->lh[level];
         ULONGLONG a=now_ms(),b;
-        if(FAILED(texture->lpVtbl->LockRect(texture,level,&lock,NULL,0)) || !lock.pBits || lock.Pitch<(INT)(w*4)) goto fail;
-        for(y=0;y<h;y++) memcpy((uint8_t *)lock.pBits+(size_t)y*lock.Pitch,p->level[level]+(size_t)y*w*4,w*4);
+        if(FAILED(texture->lpVtbl->LockRect(texture,level,&lock,NULL,0)) || !lock.pBits || lock.Pitch<(INT)row) goto fail;
+        for(y=0;y<rows;y++) memcpy((uint8_t *)lock.pBits+(size_t)y*lock.Pitch,p->level[level]+(size_t)y*row,row);
         b=now_ms(); t2+=b-a;
         if(FAILED(texture->lpVtbl->UnlockRect(texture,level))) goto fail;
         t3+=now_ms()-b;
@@ -542,7 +717,7 @@ fail:
 static int upload_png(IDirect3DDevice8 *dev,PackEntry *e,const RecompTextureSource *source)
 {
     int retry=0,result;
-    Prepared *p=prepare_png(e->path,source->width,source->height,source->row_texels,e->channel_mips,&retry);
+    Prepared *p=prepare_png(e->id,e->path,source->width,source->height,source->row_texels,e->channel_mips,&retry);
     if(!p) return retry ? -1 : 0;
     result=commit_prepared(dev,e,p);
     prepared_free(p);
@@ -631,7 +806,7 @@ enum { JOB_FREE, JOB_QUEUED, JOB_RUNNING, JOB_DONE };
 typedef struct LoadJob {
     int state;
     PackEntry *entry;
-    char path[PATH_CAP];
+    char id[65],path[PATH_CAP];
     uint32_t w,h,row_texels;
     int channel_mips,retry;
     Prepared *image;
@@ -696,6 +871,12 @@ static POOL_THREAD_RESULT load_worker(
     SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_BELOW_NORMAL);   /* the render and audio threads come first */
 #elif defined(__linux__) && defined(SYS_gettid)
     setpriority(PRIO_PROCESS,(id_t)syscall(SYS_gettid),10);
+#elif defined(__PROSPERO__)
+    {
+        /* Started from the render thread, so on the title's CPU at its priority: move off it. */
+        extern void ps5_off_guest_cpu(void) __attribute__((weak));
+        if(ps5_off_guest_cpu) ps5_off_guest_cpu();
+    }
 #endif
     pool_lock();
     for(;;) {
@@ -708,7 +889,7 @@ static POOL_THREAD_RESULT load_worker(
         }
         job->state=JOB_RUNNING;
         pool_unlock();
-        image=prepare_png(job->path,job->w,job->h,job->row_texels,job->channel_mips,&retry);
+        image=prepare_png(job->id,job->path,job->w,job->h,job->row_texels,job->channel_mips,&retry);
         pool_lock();
         job->image=image; job->retry=retry; job->done_at=now_ms(); job->state=JOB_DONE;
     }
@@ -736,7 +917,13 @@ static int workers_start(void)
     { static int ready; if(!ready) { InitializeCriticalSection(&g_job_lock); InitializeConditionVariable(&g_job_wake); ready=1; } }
     while(g_worker_count<want && (g_workers[g_worker_count]=CreateThread(NULL,0,load_worker,NULL,0,NULL))) g_worker_count++;
 #else
-    while(g_worker_count<want && !pthread_create(&g_workers[g_worker_count],NULL,load_worker,NULL)) g_worker_count++;
+    {
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr,1024*1024);   /* PNG decode; some hosts default to 64 KiB */
+        while(g_worker_count<want && !pthread_create(&g_workers[g_worker_count],&attr,load_worker,NULL)) g_worker_count++;
+        pthread_attr_destroy(&attr);
+    }
 #endif
     return g_worker_count>0;
 }
@@ -783,7 +970,7 @@ static int upload_png_async(IDirect3DDevice8 *dev,PackEntry *e,const RecompTextu
         for(i=0;i<LOAD_JOBS && g_jobs[i].state!=JOB_FREE;i++) ;
         if(i==LOAD_JOBS) { pool_unlock(); return -2; }
         job=&g_jobs[i]; memset(job,0,sizeof *job);
-        job->entry=e; snprintf(job->path,sizeof job->path,"%s",e->path);
+        job->entry=e; memcpy(job->id,e->id,65); snprintf(job->path,sizeof job->path,"%s",e->path);
         job->w=source->width; job->h=source->height; job->row_texels=source->row_texels;
         job->channel_mips=e->channel_mips; job->state=JOB_QUEUED;
         e->job=job;
@@ -807,20 +994,30 @@ static int upload_png_async(IDirect3DDevice8 *dev,PackEntry *e,const RecompTextu
 
 static const WideAnchor *wide_anchor(unsigned stage);
 static int bind_slab(IDirect3DDevice8 *dev,unsigned stage,PackEntry *e,const char *anchor);
+static volatile int g_reload;
+void texture_pack_reload(void) { if(g_initialized) g_reload=1; }   /* not read yet: it reads them as they are */
+
 int texture_pack_bind(IDirect3DDevice8 *dev,unsigned stage,const RecompTextureSource *s,RecompTextureSample sample,void *user)
 {
     struct SourceState *state=NULL; char id[65]; PackEntry *entry;
     uint64_t quick=0; int have_quick=0;
     unsigned i, slot=source_slot(s);
     ULONGLONG now=now_ms();
+    /* At the first stage of a draw, so no stage this draw already bound loses its texture. */
+    if(g_reload && stage==0 && dev) {
+        g_reload=0;
+        fprintf(stderr,"[TEXPACK] reading the packs again\n");
+        texture_pack_shutdown(dev);
+    }
+    if(stage==0) { g_bound_scale=1.0f; g_bound_scale_address=s ? s->address : 0; }
     if(!texture_pack_active() || !dev || stage>3) return 0;
     g_stage_id[stage][0]=0;
     if(!g_win.start) g_win.start=now;
     if(now-g_win.start>=2000) {
         if(g_win.loads || g_win.evictions)
-            fprintf(stderr,"  [TEXPACK] %.1fs: %u replacements uploaded (%llu MiB, %llu ms on the render thread, slowest %u ms), %u evicted, %llu of %llu MiB resident\n",
+            fprintf(stderr,"  [TEXPACK] %.1fs: %u replacements uploaded (%llu MiB, %llu ms on the render thread, slowest %u ms), %u evicted, %llu of %llu MiB resident%s\n",
                     (double)(now-g_win.start)/1000.0,g_win.loads,(unsigned long long)(g_win.bytes>>20),(unsigned long long)g_win.ms,g_win.max_ms,
-                    g_win.evictions,(unsigned long long)(g_resident>>20),(unsigned long long)(g_budget>>20));
+                    g_win.evictions,(unsigned long long)(g_resident>>20),(unsigned long long)(g_budget>>20),g_compress ? " (compressed)" : "");
         if(g_trace)
             fprintf(stderr,"  [TEXPACK] %.1fs: %u source revalidations (%llu MiB read), %u full hashes\n",
                     (double)(now-g_win.start)/1000.0,g_win.revalidated,(unsigned long long)(g_win.revalidated_bytes>>20),g_win.full_hashes);
@@ -853,9 +1050,23 @@ int texture_pack_bind(IDirect3DDevice8 *dev,unsigned stage,const RecompTextureSo
         } else state->changes++;
         if(state->used && strcmp(state->id,id)) state->dumped=0;
         state->shape=*s; state->checked=now; memcpy(state->id,id,65); state->used=1;
+        if(g_log_seen && (s->width>=128 || s->height>=128) && g_seen_count<1024) {
+            char head[17]; uint64_t key; unsigned k; int known=0;
+            memcpy(head,id,16); head[16]=0; key=strtoull(head,NULL,16);
+            for(k=0;k<g_seen_count;k++) if(g_seen_ids[k]==key) { known=1; break; }
+            if(!known) {
+                g_seen_ids[g_seen_count++]=key;
+                fprintf(stderr,"[TEXPACK] seen %s %ux%u format 0x%02X at 0x%08X%s\n",id,s->width,s->height,s->format,
+                        s->address,lookup(id) ? " (in a pack)" : "");
+            }
+        }
         state->has_quick=have_quick || texture_pack_quick(s,&quick);
         state->quick=quick;
-        if(state->changes>=REVALIDATE_UNSTABLE_CHANGES) { state->unstable=1; state->interval=REVALIDATE_UNSTABLE_MS; }
+        if(state->changes>=REVALIDATE_UNSTABLE_CHANGES) {
+            if(!state->unstable && g_log_seen && g_seen_count<1024 && (s->width>=128 || s->height>=128))
+                fprintf(stderr,"[TEXPACK] %ux%u at 0x%08X keeps changing; drawn as it is\n",s->width,s->height,s->address);
+            state->unstable=1; state->interval=REVALIDATE_UNSTABLE_MS;
+        }
         else state->interval=REVALIDATE_MIN_MS;
     }
     memcpy(g_stage_id[stage],id,65); g_stage_shape[stage]=*s;
@@ -881,11 +1092,21 @@ int texture_pack_bind(IDirect3DDevice8 *dev,unsigned stage,const RecompTextureSo
             }
         }
     }
+    if(stage==0 && g_scale_count) {
+        unsigned k;
+        for(k=0;k<g_scale_count;k++) if(!strcmp(g_scales[k].id,id)) { g_bound_scale=g_scales[k].scale; break; }
+    }
     if(g_widescreen) {
         const WideAnchor *a=wide_anchor(stage);
         if(a && a->inner && bind_slab(dev,stage,a->inner,a->id)) { ++g_hits; return 1; }
     }
     entry=lookup(id); if(!entry) { ++g_misses; return 0; }
+    if(!entry->veto_checked && g_veto && sample && source_readable(s)) {
+        entry->veto_checked=1;
+        entry->vetoed=(unsigned char)(g_veto(s,sample,user)!=0);
+        if(entry->vetoed && g_loads<64) fprintf(stderr,"[TEXPACK] %s kept as the renderer draws it (text)\n",entry->id);
+    }
+    if(entry->vetoed) return 0;
     if(entry->failed || now<entry->retry) return 0;
     if(!entry->texture) {
         const char *extension=strrchr(entry->path,'.');
@@ -969,8 +1190,9 @@ static int bind_slab(IDirect3DDevice8 *dev,unsigned stage,PackEntry *e,const cha
 void texture_pack_shutdown(IDirect3DDevice8 *dev)
 {
     size_t i;
-    if(g_active) fprintf(stderr,"[TEXPACK] hits=%llu misses=%llu dumps=%llu hashed=%llu resident=%llu\n",
-        (unsigned long long)g_hits,(unsigned long long)g_misses,(unsigned long long)g_dumps,(unsigned long long)g_hashed,(unsigned long long)g_resident);
+    if(g_active) fprintf(stderr,"[TEXPACK] hits=%llu misses=%llu dumps=%llu hashed=%llu resident=%llu disk: %lld read, %lld written, %lld MiB\n",
+        (unsigned long long)g_hits,(unsigned long long)g_misses,(unsigned long long)g_dumps,(unsigned long long)g_hashed,(unsigned long long)g_resident,
+        (long long)g_disk_hits,(long long)g_disk_writes,(long long)(g_disk_used>>20));
     workers_stop();
     g_wide_replay_filter=NULL; g_wide_replay_user=NULL;
     if(dev) for(i=0;i<g_count;i++) release_entry(dev,&g_entries[i]);
@@ -979,6 +1201,7 @@ void texture_pack_shutdown(IDirect3DDevice8 *dev)
     host_shutdown();
     g_initialized=g_active=0; g_dump[0]=0;
     g_resident=g_hits=g_misses=g_dumps=g_hashed=g_clock=0; g_source_next=0; g_loads=0;
+    g_scale_count=0; g_seen_count=0; g_bound_scale=1.0f; g_bound_scale_address=0;
 }
 
 /* ---- Host services: Windows (WIC, BCrypt, VirtualQuery) ---- */
@@ -996,6 +1219,25 @@ static ULONGLONG now_ms(void)
     return (count/hz)*1000u + (count%hz)*1000u/hz;
 }
 static int file_exists(const char *path) { return GetFileAttributesA(path)!=INVALID_FILE_ATTRIBUTES; }
+static int file_stamp(const char *path,uint64_t *size,uint64_t *mtime)
+{
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    if(!GetFileAttributesExA(path,GetFileExInfoStandard,&a)) return 0;
+    *size=((uint64_t)a.nFileSizeHigh<<32)|a.nFileSizeLow;
+    *mtime=((uint64_t)a.ftLastWriteTime.dwHighDateTime<<32)|a.ftLastWriteTime.dwLowDateTime;
+    return 1;
+}
+static int replace_file(const char *from,const char *to) { return MoveFileExA(from,to,MOVEFILE_REPLACE_EXISTING)!=0; }
+static uint64_t folder_bytes(const char *dir)
+{
+    char pattern[PATH_CAP]; WIN32_FIND_DATAA f; HANDLE h; uint64_t sum=0;
+    snprintf(pattern,sizeof pattern,"%s/*.bct",dir);
+    h=FindFirstFileA(pattern,&f);
+    if(h==INVALID_HANDLE_VALUE) return 0;
+    do sum+=((uint64_t)f.nFileSizeHigh<<32)|f.nFileSizeLow; while(FindNextFileA(h,&f));
+    FindClose(h);
+    return sum;
+}
 static void make_directories(const char *path) { SHCreateDirectoryExA(NULL,path,NULL); }
 static int memory_readable(const void *data,uint64_t bytes)
 {
@@ -1122,6 +1364,27 @@ static ULONGLONG now_ms(void)
     return (ULONGLONG)t.tv_sec*1000u+(ULONGLONG)t.tv_nsec/1000000u;
 }
 static int file_exists(const char *path) { return access(path,F_OK)==0; }
+static int file_stamp(const char *path,uint64_t *size,uint64_t *mtime)
+{
+    struct stat st;
+    if(stat(path,&st)!=0) return 0;
+    *size=(uint64_t)st.st_size; *mtime=(uint64_t)st.st_mtime;
+    return 1;
+}
+static int replace_file(const char *from,const char *to) { return rename(from,to)==0; }
+static uint64_t folder_bytes(const char *dir)
+{
+    DIR *d=opendir(dir); struct dirent *e; uint64_t sum=0;
+    if(!d) return 0;
+    while((e=readdir(d))!=NULL) {
+        char path[PATH_CAP]; struct stat st; size_t n=strlen(e->d_name);
+        if(n<4 || strcmp(e->d_name+n-4,".bct")) continue;
+        snprintf(path,sizeof path,"%s/%s",dir,e->d_name);
+        if(stat(path,&st)==0) sum+=(uint64_t)st.st_size;
+    }
+    closedir(d);
+    return sum;
+}
 static void make_directories(const char *path)
 {
     char copy[PATH_CAP],*p;

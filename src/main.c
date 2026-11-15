@@ -103,7 +103,15 @@ extern ptrdiff_t g_xbox_mem_offset;
  */
 #define YOUR_GAME_ENTRY_POINT   0x001F6357  /* XBE entry point VA */
 #define YOUR_GAME_XBE_PATH      "game/default.xbe"   /* forward slashes: fine for CreateFile/fopen */
+#if defined(__PROSPERO__)            /* [ps5 port] <app folder>/GameData, as in the other PS5 ports */
+const char *ps5_game_dir(void);
+const char *ps5_game_xbe(void);
+#define YOUR_GAME_DIR            ps5_game_dir()
+#undef  YOUR_GAME_XBE_PATH
+#define YOUR_GAME_XBE_PATH       ps5_game_xbe()
+#else
 #define YOUR_GAME_DIR            "game"
+#endif
 
 /* ── Forward declarations ──────────────────────────────────── */
 
@@ -383,7 +391,13 @@ void host_fatal(const char *message)
     MessageBoxA(NULL, message, "Def Jam: Fight for NY", MB_ICONERROR);
 #else
     fprintf(stderr, "Def Jam: Fight for NY: %s\n", message);
-    fflush(stderr);
+    (fflush)(stderr);
+#if defined(__PROSPERO__)
+    {   /* [ps5 port] nobody sees stderr on the console */
+        extern void ps5_notify(const char *text);
+        ps5_notify(message);
+    }
+#endif
 #endif
 }
 
@@ -521,6 +535,20 @@ static void fault_handler(int sig, siginfo_t *si, void *ctx)
     if ((sig == SIGBUS || sig == SIGSEGV) && mmio_trap_neighbour(ctx, fault_addr))
         return;
 
+#if defined(__PROSPERO__)
+    {
+        /* [ps5 port] First a line straight into ps5.log, which needs no lock,
+         * then a deadline: if the report below blocks (this thread may hold
+         * the stderr lock already), the app still closes. */
+        extern void ps5_crash_note(const char *what, unsigned long long pc,
+                                   unsigned long long addr);
+        ps5_crash_note(sig == SIGSEGV ? "SIGSEGV" : sig == SIGBUS ? "SIGBUS" : sig == SIGILL ? "SIGILL"
+                       : sig == SIGFPE ? "SIGFPE" : sig == SIGABRT ? "SIGABRT" : "signal",
+                       (unsigned long long)HOST_PC(ctx), (unsigned long long)fault_addr);
+        alarm(10);
+    }
+#endif
+
     fprintf(stderr, "[CRASH] %s (%s) at PC=0x%llX, fault addr=0x%llX\n",
             sig == SIGBUS || sig == SIGSEGV ? "Access violation" : "Fatal signal",
             sig == SIGBUS ? "SIGBUS" : sig == SIGSEGV ? "SIGSEGV" : sig == SIGILL ? "SIGILL"
@@ -535,20 +563,29 @@ static void fault_handler(int sig, siginfo_t *si, void *ctx)
     else
         fprintf(stderr, "  The fault address is outside guest memory\n");
     {
-        const uint32_t *ip = (const uint32_t *)(uintptr_t)HOST_PC(ctx);
+        const uint32_t *ip = (const uint32_t *)mmio_trap_code((uintptr_t)HOST_PC(ctx));
         Dl_info info;
         /* Only read the instruction if the address is inside a loaded image. */
         if (dladdr(ip, &info) && info.dli_fname)
             fprintf(stderr, "  host instruction: %08X\n", *ip);
     }
     print_guest_context((void *)(uintptr_t)HOST_PC(ctx));
-    fflush(stdout);
-    fflush(stderr);
+    (fflush)(stdout);       /* [ps5 port] the real flush (the PS5 build quiets the plain one) */
+    (fflush)(stderr);
     {
         char what[96];
         snprintf(what, sizeof what, "signal %d at fault address 0x%llX", sig, (unsigned long long)fault_addr);
         recorder_on_crash(what);
     }
+#if defined(__PROSPERO__)
+    {   /* [ps5 port] say so on screen, then close instead of hanging */
+        extern void ps5_notify(const char *text);
+        (fflush)(stderr);
+        ps5_notify("Def Jam crashed. Send logs/defjam.log.err from the app folder.");
+        sleep(3);
+        _exit(1);
+    }
+#endif
     /* Put the default action back; the instruction faults again and the
      * process ends with the signal, as an unhandled exception would. */
     signal(sig, SIG_DFL);
@@ -606,6 +643,10 @@ static int host_main(void)
      * start-up -- the chattiest phase -- the title crawled at a frame every
      * second or so in some runs, with most of its threads queued on that lock
      * behind two writers doing single-character system calls. */
+    /* [ps5 port] Buffered on the console too. Unbuffered there, libc wrote
+     * a character at a time, each one a system call of most of a
+     * millisecond, and the title crawled at a few kernel calls a second on
+     * a black screen. The PS5 host flushes every second instead. */
     setvbuf(stdout, NULL, _IOFBF, 1 << 16);
     setvbuf(stderr, NULL, _IOFBF, 1 << 16);
     { extern void input_latency_start(void); input_latency_start(); }
@@ -615,6 +656,9 @@ static int host_main(void)
     /* Find the game folder, open a log if nothing captures the output, supply
      * the runtime's required switches and load settings.ini -- before anything
      * reads the environment. See src/hooks/pc_settings.c. */
+#if defined(__PROSPERO__)
+    fprintf(stderr, "[PS5] host_main: reading settings\n");
+#endif
     if (!pc_settings_init())
         return 1;
 
@@ -780,8 +824,14 @@ static int host_main(void)
         char user_data_utf8[1024];
 
         if (data && *data) {
+#if defined(__PROSPERO__)
+            /* [ps5 port] Outside the app folder (ps5/src/host_ps5.c). */
+            extern const char *ps5_save_dir(void);
+            snprintf(save, sizeof(save), "%s", ps5_save_dir());
+#else
             snprintf(save, sizeof(save), "%s%ssave", data,
                      data[strlen(data) - 1] == HOST_SEP_CHAR ? "" : HOST_SEP);
+#endif
             xbox_path_init(YOUR_GAME_DIR, save);
         } else {
             xbox_path_init(YOUR_GAME_DIR, NULL);

@@ -162,6 +162,12 @@ static inline uint64_t mmio_imm(const uint8_t *p, int size, int *len)
                                       | ((uint32_t)p[3] << 24));
 }
 
+/* [ps5 port] Where the decoder reads instruction bytes: PS5 code pages are
+ * execute-only, so the port maps Rip into its readable copy (code.bin). */
+#ifndef MMIO_CODE_PTR
+#define MMIO_CODE_PTR(rip) ((const uint8_t *)(rip))
+#endif
+
 /* 1 if the instruction at ctx->Rip was serviced and Rip advanced past it.
  *
  * Covered: MOV both ways (88/89 8A/8B C6/C7), MOVZX (0F B6/B7), the
@@ -175,7 +181,7 @@ static inline uint64_t mmio_imm(const uint8_t *p, int size, int *len)
 static inline int mmio_emulate(mmio_ctx_t ctx, uint32_t off, void *dev,
                                mmio_read_fn rd, mmio_write_fn wr)
 {
-    const uint8_t *ip = (const uint8_t *)ctx->Rip;
+    const uint8_t *ip = MMIO_CODE_PTR(ctx->Rip);
     int prefix = 0, has66 = 0, rex = 0, has_rex = 0;
     const uint8_t *op;
     int size, rex_w, rex_r, rex_b, mlen, reg, ilen, alu;

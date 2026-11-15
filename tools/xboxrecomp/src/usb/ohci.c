@@ -511,8 +511,11 @@ static uint64_t ohci_clock(uint32_t interval, uint32_t *remaining)
     uint64_t scaled, millis, phase;
     QueryPerformanceFrequency(&f);
     QueryPerformanceCounter(&q);
-    scaled = (uint64_t)q.QuadPart * 1000u;
-    millis = scaled / (uint64_t)f.QuadPart;
+    /* Whole seconds apart from the rest: the counter can be a raw time stamp
+     * counter since power-on (the PS5), and counter * 1000 would pass 64 bits
+     * after two months of uptime at 3.5 GHz. */
+    scaled = ((uint64_t)q.QuadPart % (uint64_t)f.QuadPart) * 1000u;
+    millis = ((uint64_t)q.QuadPart / (uint64_t)f.QuadPart) * 1000u + scaled / (uint64_t)f.QuadPart;
     phase = scaled % (uint64_t)f.QuadPart;
     if (remaining)
         *remaining = interval - (uint32_t)(phase * interval / (uint64_t)f.QuadPart);
@@ -1625,7 +1628,11 @@ int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
     ok = mmio_emulate(ctx, xbox_va - hc->base, hc,
                       ohci_read, ohci_write);
     if (!ok && hc->decode_fail++ < 20) {
+#if defined(_WIN32)
         const uint8_t *ip = (const uint8_t *)(uintptr_t)s_last_write_rip;
+#else
+        const uint8_t *ip = mmio_trap_code((uintptr_t)s_last_write_rip);
+#endif
         fprintf(stderr, "  [OHCI%d] undecoded access at +0x%03X: "
                         "%02X %02X %02X %02X %02X %02X\n",
                 hc->index, xbox_va - hc->base,
