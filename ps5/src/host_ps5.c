@@ -1209,6 +1209,24 @@ int host_posix_run(int (*game_main)(void))
     (void)chdir(root);
     if (!getenv("DEFJAM_DATA"))
         setenv("DEFJAM_DATA", root, 1);
+    {   /* [blz] Test switches: <app>/ps5-env.txt, one NAME=VALUE a line (a scripted pad,
+         * RECOMP_PAD_SCRIPT, as the desktop harness gives; # starts a comment). Read before
+         * anything looks at the environment; absent = a normal start. */
+        char path[400];
+        FILE *f;
+        snprintf(path, sizeof path, "%s/ps5-env.txt", root);
+        if ((f = fopen(path, "r")) != NULL) {
+            static char line[16384];
+            while (fgets(line, sizeof line, f)) {
+                char *eq = strchr(line, '='), *end = line + strlen(line);
+                while (end > line && (end[-1] == '\n' || end[-1] == '\r')) *--end = 0;
+                if (line[0] == '#' || !eq || eq == line) continue;
+                *eq = 0;
+                setenv(line, eq + 1, 1);
+            }
+            fclose(f);
+        }
+    }
     snprintf(log, sizeof log, "%s/logs", root);
     mkdir(log, 0777);
     keep_previous_logs(root);
