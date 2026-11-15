@@ -168,7 +168,7 @@ if(DEFJAM_BUILD_GAME)
     elseif(PS5)
         # [ps5 port] No window and no desktop launcher: ps5/src/host_ps5.c
         # sends the picture to the TV and reads the DualSense.
-        list(FILTER HOOK_SOURCES EXCLUDE REGEX "/(watchpoint\\.c|pc_launcher\\.cpp|pc_launcher_sdl\\.cpp)$")
+        list(FILTER HOOK_SOURCES EXCLUDE REGEX "/(watchpoint\\.c|pc_launcher\\.cpp|pc_launcher_sdl\\.cpp|pc_launcher_home\\.cpp)$")
         set(HOST_SOURCES ps5/src/host_ps5.c ps5/src/ps5_libc_compat.c ps5/src/ps5_profile.c
                          ps5/src/ps5_gamewatch.c ps5/src/ps5_text.c ps5/src/ps5_framegen.cpp)
         # Frame generation (beta): MihawkGen, GPL-3.0-or-later (ps5/third_party/mihawkgen).
