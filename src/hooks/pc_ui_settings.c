@@ -10,6 +10,13 @@
 
 #include "pc_ui.h"
 
+/* [blz] 16 Nov: Markus expects every fighter and venue on the PS5 from the start. */
+#if defined(__PROSPERO__)
+#define PC_DEFAULT_UNLOCK_ALL 1
+#else
+#define PC_DEFAULT_UNLOCK_ALL 0
+#endif
+
 size_t pc_ui_settings(RecompSetting *out, size_t max)
 {
     size_t n = 0;
@@ -23,7 +30,7 @@ size_t pc_ui_settings(RecompSetting *out, size_t max)
     ADD("launcher", "check_updates", RECOMP_SETTING_BOOL, 1, 0, 0, NULL, NULL, 0,
         "When the app starts, look on GitHub for a newer Def Jam Recompiled and offer to update. Nothing about "
         "you, this computer or your game is sent. The game itself never checks.");
-    ADD("debug", "unlock_all", RECOMP_SETTING_BOOL, 0, 0, 0, NULL, "RECOMP_UNLOCK_ALL", RECOMP_SETTING_RESTART,
+    ADD("debug", "unlock_all", RECOMP_SETTING_BOOL, PC_DEFAULT_UNLOCK_ALL, 0, 0, NULL, "RECOMP_UNLOCK_ALL", RECOMP_SETTING_RESTART,
         "Debug: every fighter and venue is available on any profile, through the developers' own unlock "
         "routine in the game. Meant for testing; it changes the profile in memory and asks the game to save "
         "it, so do not use it on a save you care about.");
