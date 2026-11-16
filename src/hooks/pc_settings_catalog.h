@@ -26,7 +26,7 @@ extern "C" {
  * the border picture beside 4:3 menus, and the HD packs in mods/ on. */
 #define PC_DEFAULT_ASPECT 3        /* 16:9 */
 #define PC_DEFAULT_RENDER_SCALE 4
-#define PC_DEFAULT_SIDE_FILL 0     /* blur: [blz] 16 Nov, Markus saw black bars beside 4:3 menus (border-logo.png is not packaged); blur fills them with the picture */
+#define PC_DEFAULT_SIDE_FILL 3     /* stretch: [blz] 16 Nov, Markus wants menus full screen - no black, border or blurred sides */
 #define PC_DEFAULT_TEXTURES 1
 #else
 #define PC_DEFAULT_ASPECT 2        /* widescreen (auto) */

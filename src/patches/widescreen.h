@@ -22,7 +22,7 @@ extern "C" {
 
 enum { WS_HUD_AUTO, WS_HUD_EDGE, WS_HUD_CENTERED };
 enum { WS_CUTSCENES_AUTHORED, WS_CUTSCENES_FILL };
-enum { WS_FILL_BLUR, WS_FILL_BLACK, WS_FILL_BORDER };   /* border: drawn by the host's overlay */
+enum { WS_FILL_BLUR, WS_FILL_BLACK, WS_FILL_BORDER, WS_FILL_STRETCH };   /* stretch: [blz] the 4:3 picture drawn full width by the renderer */   /* border: drawn by the host's overlay */
 
 /* Resolve the settings once, after the launcher and before the renderer is
  * created, and hand the canvas to the renderer. Returns the aspect (0 = off). */

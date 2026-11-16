@@ -2738,6 +2738,50 @@ static uint32_t s_blur_generation;
 static VkImage s_blur_src;            /* the picture being presented, a transfer source */
 
 void d3d8_vk_request_side_blur(void) { s_blur_requested = 1; }
+static int s_stretch_requested;
+void d3d8_vk_request_side_stretch(void) { s_stretch_requested = 1; }
+
+/* [blz] The 4:3 middle of the picture blitted over the whole picture area of the window image (in
+ * transfer-destination layout): a menu, movie or loading screen then fills the screen with no bars. */
+static void side_stretch(uint32_t image)
+{
+    VkImageBlit b;
+    VkOffset3D pic[2];
+    uint32_t bw, x0;
+
+    if (!s_blur_src || !vk.tw || !vk.th)
+        return;
+    bw = vk.th * 4 / 3;
+    if (bw >= vk.tw)
+        return;
+    x0 = (vk.tw - bw) / 2;
+    present_rect(vk.swap_ext.width, vk.swap_ext.height, pic);
+    memset(&b, 0, sizeof b);
+    b.srcSubresource.aspectMask = b.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    b.srcSubresource.layerCount = b.dstSubresource.layerCount = 1;
+    b.srcOffsets[0].x = (int32_t)x0;
+    b.srcOffsets[1].x = (int32_t)(x0 + bw);
+    b.srcOffsets[1].y = (int32_t)vk.th;
+    b.srcOffsets[1].z = 1;
+    b.dstOffsets[0] = pic[0];
+    b.dstOffsets[1] = pic[1];
+    b.dstOffsets[0].z = 0;
+    b.dstOffsets[1].z = 1;
+    {   /* the present blit wrote this image a moment ago: order the two writes */
+        VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+        mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                             1, &mb, 0, NULL, 0, NULL);
+    }
+    vkCmdBlitImage(vk.cmd, s_blur_src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   vk.swap_img[image], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
+    {
+        static int told;
+        if (!told++)
+            fprintf(stderr, "[D3D8-VK] side stretch: 4:3 picture %ux%u drawn full width\n", bw, vk.th);
+    }
+}
 
 static int side_blur(void)
 {
@@ -2804,8 +2848,11 @@ static int overlay_draw(uint32_t image)
     int blurred;
 
     s_blur_requested = 0;
+    s_stretch_requested = 0;
     if (!s_have_overlay || !s_overlay.active(s_overlay.user) || !overlay_prepare(image))
         return 0;
+    if (s_stretch_requested)
+        side_stretch(image);
     blurred = s_blur_requested && side_blur();
     image_layout(vk.cmd, vk.swap_img[image], VK_IMAGE_ASPECT_COLOR_BIT,
                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);

@@ -34,7 +34,7 @@ static const char *const k_ws_cutscenes[] = { "authored", "fill", NULL };
 #if defined(__PROSPERO__)
 /* [ps5 port] "border": a picture beside 4:3 menus (borders/ in the app folder), which goes away
  * as soon as the game draws its own 3D there; which picture is [display] border. */
-static const char *const k_ws_fill[] = { "blur", "black", "border", NULL };
+static const char *const k_ws_fill[] = { "blur", "black", "border", "stretch", NULL };
 static const char *const k_border[] = { "logo", "red", "gold", "plain", NULL };
 #else
 static const char *const k_ws_fill[] = { "blur", "black", NULL };
@@ -69,9 +69,9 @@ static RecompSetting g_display_settings[] = {
 #if defined(__PROSPERO__)
     { "display", "widescreen_side_fill", RECOMP_SETTING_ENUM, PC_DEFAULT_SIDE_FILL, 0, 0, k_ws_fill, NULL,
       RECOMP_SETTING_RESTART,
-      "Beside 4:3 pictures (menus, movies, loading screens) in widescreen: a soft blurred extension, black, or a "
-      "border picture (borders/border.png in the game's folder), which goes away as soon as the game draws its "
-      "own 3D there." },
+      "Beside 4:3 pictures (menus, movies, loading screens) in widescreen: a soft blurred extension, black, a "
+      "border picture (borders/border.png in the game's folder), or stretch (the 4:3 picture fills the whole "
+      "screen); all go away as soon as the game draws its own 3D there." },
 #else
     { "display", "widescreen_side_fill", RECOMP_SETTING_ENUM, 0, 0, 0, k_ws_fill, NULL, RECOMP_SETTING_RESTART,
       "Beside 4:3 pictures (movies, menu backgrounds) in widescreen: a soft blurred extension, or black." },

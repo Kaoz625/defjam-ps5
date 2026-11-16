@@ -108,7 +108,7 @@ float ws_init(int window_w, int window_h, int fullscreen)
         nv2a_ws_configure(g_k, g_hud == WS_HUD_CENTERED && a > 16.0f / 9.0f ? (16.0f / 9.0f) / a : 1.0f);
         {
             extern void nv2a_ws_set_side_fill(int on);
-            nv2a_ws_set_side_fill(g_fill == WS_FILL_BLUR);
+            nv2a_ws_set_side_fill(g_fill == WS_FILL_BLUR || g_fill == WS_FILL_STRETCH);
         }
         {
             extern void nv2a_ws_set_left_tag(float y_offset);
@@ -117,7 +117,7 @@ float ws_init(int window_w, int window_h, int fullscreen)
         fprintf(stderr, "[WS] widescreen %.4f (k %.4f), HUD %s, cutscenes %s, sides %s, FOV cap %.0f\n",
                 a, g_k, g_hud == WS_HUD_EDGE ? "edge" : "centred",
                 g_cutscenes == WS_CUTSCENES_FILL ? "fill" : "authored",
-                g_fill == WS_FILL_BLACK ? "black" : g_fill == WS_FILL_BORDER ? "border" : "blur", g_fov_cap);
+                g_fill == WS_FILL_BLACK ? "black" : g_fill == WS_FILL_BORDER ? "border" : g_fill == WS_FILL_STRETCH ? "stretch" : "blur", g_fov_cap);
     } else {
         d3d8_present_set_canvas_aspect(0, 0);
     }

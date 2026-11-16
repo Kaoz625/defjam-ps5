@@ -2963,7 +2963,7 @@ void border_start_read()
 bool border_tick()
 {
     int mode = g_side_mode.load();
-    if (mode != 0 && mode != 2) {
+    if (mode != 0 && mode != 2 && mode != 3) {     // 3 = stretch ([blz]): the renderer draws the 4:3 picture full width
         g_border.on = false;
         g_border.alpha = 0.0f;
         return false;
@@ -2989,6 +2989,12 @@ bool border_tick()
     if (g_border.alpha > 1.0f) g_border.alpha = 1.0f;
     if (mode == 0 && g_border.alpha > 0.0f)
         d3d8_vk_request_side_blur();    // made in this present, handed to draw() as side_blur
+    if (mode == 3) {                    // no fade: a stretched picture half-faded over its own sides makes no sense
+        g_border.alpha = 0.0f;
+        if (g_border.on)
+            d3d8_vk_request_side_stretch();
+        return false;
+    }
     return g_border.alpha > 0.0f;
 }
 

@@ -87,6 +87,8 @@ void d3d8_vk_set_cache_dir(const char *dir);
 /* From the overlay's active(): blur the picture's 4:3 middle this frame and pass
  * it to draw() as side_blur, for filling the sides beside a 4:3 menu. */
 void d3d8_vk_request_side_blur(void);
+/* [blz] This present: draw the middle 4:3 of the picture over the whole picture area (menus full screen). */
+void d3d8_vk_request_side_stretch(void);
 
 /* A frame generator, the host's: with one set (on a display refreshing at twice
  * the title's rate), each title frame is shown twice, first as a picture the
