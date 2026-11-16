@@ -245,6 +245,16 @@ static void scan_pads(void)
         desc.Rumble = pad_rumble;
         slot->id = SDL_AttachVirtualJoystick(&desc);
         slot->joy = slot->id ? SDL_OpenJoystick(slot->id) : NULL;
+        if (!slot->joy) {
+            /* [blz] Say it: on 16 Nov this failed silently (SDL built without virtual joysticks) and
+             * the log claimed a DualSense the game never saw. Retried on the next scan. */
+            fprintf(stderr, "[PS5] DualSense for user 0x%x NOT attached: %s\n", (unsigned)user, SDL_GetError());
+            if (slot->id) SDL_DetachVirtualJoystick(slot->id);
+            scePadClose(handle);
+            slot->handle = -1;
+            slot->id = 0;
+            continue;
+        }
         fprintf(stderr, "[PS5] DualSense for user 0x%x (pad handle %d)\n", (unsigned)user, handle);
     }
     s_last_scan = SDL_GetTicks();

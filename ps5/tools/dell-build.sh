@@ -113,6 +113,12 @@ stage_prefix() {
         local t=$W/dl/SDL3-$SDL3_VERSION.tar.gz
         [[ -f $t ]] || wget -q -O "$t" "https://github.com/libsdl-org/SDL/releases/download/release-$SDL3_VERSION/SDL3-$SDL3_VERSION.tar.gz"
         rm -rf "$W/sdl3-src" && mkdir -p "$W/sdl3-src" && tar -xzf "$t" -C "$W/sdl3-src" --strip-components=1
+        # [blz] SDL ties its virtual-joystick driver to HIDAPI, which is off here, and the DualSense
+        # reaches the game ONLY as a virtual joystick (host_ps5.c pads_init): without this the game
+        # found 0 pads and no button worked on a real console (PHAT5, 16 Nov 2026). Scripted-pad
+        # tests skip that path, so they passed anyway.
+        sed -i 's/^dep_option(SDL_VIRTUAL_JOYSTICK \(.*\) ON SDL_HIDAPI OFF)/dep_option(SDL_VIRTUAL_JOYSTICK \1 ON SDL_JOYSTICK OFF)/' "$W/sdl3-src/CMakeLists.txt"
+        grep -q "SDL_VIRTUAL_JOYSTICK .* ON SDL_JOYSTICK OFF" "$W/sdl3-src/CMakeLists.txt" || { echo "SDL virtual-joystick patch did not apply" >&2; exit 1; }
         ps5_cmake -S "$W/sdl3-src" -B "$W/sdl3-build" \
             -DSDL_SHARED=OFF -DSDL_STATIC=ON -DSDL_TEST_LIBRARY=OFF -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF \
             -DSDL_UNIX_CONSOLE_BUILD=ON -DSDL_VIDEO=ON -DSDL_DUMMYVIDEO=ON -DSDL_RENDER=ON \
@@ -121,7 +127,7 @@ stage_prefix() {
             -DSDL_HIDAPI=OFF -DSDL_HAPTIC=OFF -DSDL_SENSOR=OFF -DSDL_POWER=OFF -DSDL_DIALOG=OFF \
             -DSDL_TRAY=OFF -DSDL_LIBUDEV=OFF -DSDL_DBUS=OFF -DSDL_IBUS=OFF -DSDL_PIPEWIRE=OFF \
             -DSDL_PULSEAUDIO=OFF -DSDL_ALSA=OFF -DSDL_JACK=OFF -DSDL_SNDIO=OFF -DSDL_OSS=OFF \
-            -DSDL_LIBURING=OFF -DSDL_RPATH=OFF -DSDL_DEPS_SHARED=OFF -DSDL_CLOCK_GETTIME=ON \
+            -DSDL_VIRTUAL_JOYSTICK=ON -DSDL_LIBURING=OFF -DSDL_RPATH=OFF -DSDL_DEPS_SHARED=OFF -DSDL_CLOCK_GETTIME=ON \
             > "$W/logs/sdl3.log" 2>&1 || { tail -40 "$W/logs/sdl3.log"; exit 1; }
         ninja -C "$W/sdl3-build" -j "$JOBS" install >> "$W/logs/sdl3.log" 2>&1 ||
             { grep -E "error|FAILED" "$W/logs/sdl3.log" | head -30; exit 1; }
